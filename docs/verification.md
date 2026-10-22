@@ -22,6 +22,14 @@
 
 ## VM에서 남은 검증
 
+### 지도 403 수정 (2026-10-22)
+
+전역 `same-origin` Referrer-Policy 때문에 외부 지도 타일 요청에 Referer가 빠지는 설정을 확인했다. [OpenStreetMap 타일 정책](https://operations.osmfoundation.org/policies/tiles/)에 맞춰 Leaflet 타일 이미지에만 `strict-origin-when-cross-origin`을 지정했다. 지도 서버에는 사이트 origin만 보내며 페이지 경로·쿼리 문자열은 보내지 않는다. 로그인과 나머지 요청의 전역 정책은 유지했다. 타일 로딩 오류 안내와 저작권 링크도 추가했다.
+
+로컬 브라우저에서 동아대 주변 지도가 표시되는 것과 6개 타일 이미지의 로딩 및 개별 referrerPolicy 적용을 확인했다. 운영·테스트 설정의 기존 자동 테스트 각 26건도 통과했다. 수정본을 GitHub에 반영한 뒤 VM의 `bash manage.sh` → `7 GitHub 업데이트`로 실행 중인 운영·테스트 환경을 다시 배포하고 브라우저를 새로고침한다. VM에는 직접 배포하지 않았다.
+
+### 환경 검증
+
 개발 PC에는 Docker 엔진이 없어 Docker 이미지 빌드/컨테이너 실행/실제 PostgreSQL 동시성/Ubuntu 설치·백업·복구를 실행하지 못했다. 소스에 PostgreSQL 기반 GitHub Actions 테스트와 별도의 컨테이너 smoke workflow를 포함했으나 원격 저장소에 push하지 않았으므로 이 실행 결과를 주장하지 않는다.
 
 VM에서 1→필요시 2→3→4→13 메뉴를 실행하고 다음을 확인한다.
