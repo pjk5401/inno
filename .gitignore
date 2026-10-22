@@ -1,0 +1,14 @@
+.venv/
+.tmp/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.sqlite3
+var/
+staticfiles/
+outputs/
+festival-check/
+.coverage
+.pytest_cache/

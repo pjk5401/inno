@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block width %}narrow{% endblock %}{% block content %}<div class="page-head"><h1>{{ title }}</h1><p class="muted">{{ note }}</p></div><form method="post" class="card stack">{% csrf_token %}{{ form.as_p }}<button>저장</button></form>{% endblock %}

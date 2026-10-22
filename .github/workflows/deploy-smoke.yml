@@ -1,0 +1,50 @@
+name: container-smoke
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare isolated CI storage and credentials
+        run: |
+          sudo mkdir -p /var/lib/attendance/{postgres,signatures/live,signatures/test,backups}
+          sudo chown -R 10001:10001 /var/lib/attendance/signatures
+          {
+            echo 'PUBLIC_ORIGIN=http://localhost'
+            echo 'ALLOWED_HOSTS=localhost,127.0.0.1'
+            for key in POSTGRES_PASSWORD LIVE_DB_PASSWORD TEST_DB_PASSWORD LIVE_SECRET_KEY TEST_SECRET_KEY; do
+              printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
+            done
+          } > "$RUNNER_TEMP/attendance.env"
+      - name: Build, migrate and start both environments
+        run: |
+          set -euo pipefail
+          dc() { docker compose --env-file "$RUNNER_TEMP/attendance.env" --profile test "$@"; }
+          dc build live
+          dc up -d --wait db
+          dc run --rm live python manage.py migrate --noinput
+          dc run --rm test python manage.py migrate --noinput
+          dc up -d --wait --wait-timeout 120 live test nginx
+          curl -fsS http://localhost/health/
+          curl -fsS http://localhost/test/health/
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/test/staff/login/)" = 200
+      - name: Verify database access isolation
+        run: |
+          docker compose --env-file "$RUNNER_TEMP/attendance.env" exec -T live python - <<'PY'
+          import os, psycopg
+          try:
+              psycopg.connect(host='db', dbname='attendance_test', user=os.environ['DB_USER'], password=os.environ['DB_PASSWORD'])
+          except psycopg.OperationalError:
+              print('Live DB account cannot connect to test DB: OK')
+          else:
+              raise SystemExit('Database isolation failed')
+          PY
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --env-file "$RUNNER_TEMP/attendance.env" --profile test logs --tail 100
+      - name: Stop CI containers
+        if: always()
+        run: docker compose --env-file "$RUNNER_TEMP/attendance.env" --profile test down

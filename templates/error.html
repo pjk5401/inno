@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block width %}narrow{% endblock %}{% block content %}<section class="card hero"><span class="status-icon warning">!</span><h1>확인이 필요합니다</h1><p role="alert">{{ error }}</p><p class="small muted">작성 중이었다면 같은 브라우저에서 새 QR을 열어주세요.<br>계속 문제가 발생하면 이 화면을 조교에게 보여주세요.</p><a class="button secondary" href="{% url 'home' %}">안내 화면</a></section>{% endblock %}

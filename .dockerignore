@@ -1,0 +1,10 @@
+.git
+.venv
+.tmp
+festival-check
+var
+outputs
+*.sqlite3
+**/__pycache__
+.env*
+staticfiles

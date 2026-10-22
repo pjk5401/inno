@@ -1,0 +1,98 @@
+name: attendance
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+x-app: &app
+  image: attendance-service:local
+  build: .
+  restart: unless-stopped
+  init: true
+  logging: *logging
+  stop_grace_period: 40s
+  depends_on:
+    db:
+      condition: service_healthy
+  networks: [internal]
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    mem_limit: 768m
+    shm_size: 128m
+    logging: *logging
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run manage.sh setup}
+      LIVE_DB_PASSWORD: ${LIVE_DB_PASSWORD:?Run manage.sh setup}
+      TEST_DB_PASSWORD: ${TEST_DB_PASSWORD:?Run manage.sh setup}
+    command: [postgres, -c, shared_buffers=128MB, -c, max_connections=60, -c, work_mem=4MB]
+    volumes:
+      - /var/lib/attendance/postgres:/var/lib/postgresql/data
+      - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/10-databases.sh:ro
+    networks: [internal]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  live:
+    <<: *app
+    mem_limit: 768m
+    environment:
+      APP_ENV: live
+      DEBUG: "0"
+      SECRET_KEY: ${LIVE_SECRET_KEY:?Run manage.sh setup}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Run manage.sh setup}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:?Run manage.sh setup}
+      TRUST_PROXY_HTTPS: ${TRUST_PROXY_HTTPS:-0}
+      DB_HOST: db
+      DB_NAME: attendance_live
+      DB_USER: attendance_live
+      DB_PASSWORD: ${LIVE_DB_PASSWORD:?Run manage.sh setup}
+      MEDIA_ROOT: /data/signatures
+    volumes:
+      - /var/lib/attendance/signatures/live:/data/signatures
+      - /var/lib/attendance/backups:/backups:ro
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/',timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 6
+  test:
+    <<: *app
+    profiles: [test]
+    mem_limit: 512m
+    command: [gunicorn, config.wsgi:application, --bind, "0.0.0.0:8000", --workers, "1", --threads, "2", --timeout, "90", --graceful-timeout, "30", --error-logfile, "-"]
+    environment:
+      APP_ENV: sandbox
+      DEBUG: "0"
+      SECRET_KEY: ${TEST_SECRET_KEY:?Run manage.sh setup}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Run manage.sh setup}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:?Run manage.sh setup}
+      TRUST_PROXY_HTTPS: ${TRUST_PROXY_HTTPS:-0}
+      DB_HOST: db
+      DB_NAME: attendance_test
+      DB_USER: attendance_test
+      DB_PASSWORD: ${TEST_DB_PASSWORD:?Run manage.sh setup}
+      MEDIA_ROOT: /data/signatures
+    volumes:
+      - /var/lib/attendance/signatures/test:/data/signatures
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/test/health/',timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 6
+  nginx:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *logging
+    ports: ["80:80"]
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks: [internal]
+    depends_on: [live]
+networks:
+  internal:
+    driver: bridge
