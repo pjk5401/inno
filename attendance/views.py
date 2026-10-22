@@ -19,7 +19,7 @@ from django.core.exceptions import ValidationError
 from django.core import signing
 from django.core.paginator import Paginator
 from django.db import connection, transaction
-from django.db.models import Q, Count
+from django.db.models import Q, Count, Prefetch
 from django.http import JsonResponse, HttpResponse, FileResponse, Http404
 from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
@@ -41,12 +41,21 @@ def staff_required(view=None, *, admin=False):
         return inner
     return decorator(view) if view else decorator
 
-def browser_id(request):
-    value = request.get_signed_cookie(settings.BROWSER_COOKIE_NAME, default='', salt='browser-identity', max_age=settings.BROWSER_COOKIE_AGE)
+def browser_cookie(request):
+    if settings.BROWSER_COOKIE_NAME not in request.COOKIES:
+        return None, 'missing'
     try:
-        return uuid.UUID(value)
+        value = request.get_signed_cookie(settings.BROWSER_COOKIE_NAME, salt='browser-identity', max_age=settings.BROWSER_COOKIE_AGE)
+        return uuid.UUID(value), 'valid'
+    except signing.SignatureExpired:
+        return None, 'expired'
+    except signing.BadSignature:
+        return None, 'invalid_signature'
     except (ValueError, TypeError):
-        return None
+        return None, 'invalid_format'
+
+def browser_id(request):
+    return browser_cookie(request)[0]
 
 def get_attempt(request):
     value = request.session.get('attempt')
@@ -68,7 +77,22 @@ def csrf_failure(request, reason=''):
 
 def enter(request):
     try:
-        attempt = svc.exchange_qr(request.GET.get('q',''), browser_id(request))
+        identity, cookie_state = browser_cookie(request)
+        previous = None
+        try:
+            previous = Attempt.objects.select_related('browser').filter(pk=request.session.get('attempt')).first()
+        except (ValidationError,ValueError):
+            pass
+        with transaction.atomic():
+            attempt = svc.exchange_qr(request.GET.get('q',''), identity)
+            # Diagnostic classifications only: never store cookie values, QR tokens or IPs.
+            svc.audit(None,'QR 브라우저 확인',attempt.pk,
+                cookie_state=cookie_state, browser_code=attempt.browser.support_code,
+                reused=identity == attempt.browser_id,
+                previous_browser_code=previous.browser.support_code if previous and previous.browser_id else '',
+                session_cookie_present=settings.SESSION_COOKIE_NAME in request.COOKIES,
+                host=request.get_host(), fetch_site=request.META.get('HTTP_SEC_FETCH_SITE','')[:32],
+                generation=attempt.generation)
         request.session['attempt'] = str(attempt.id)
         response = redirect('checkin')
         response.set_signed_cookie(settings.BROWSER_COOKIE_NAME, str(attempt.browser_id), salt='browser-identity',
@@ -541,3 +565,28 @@ def health(request):
         return JsonResponse({'status':'ok'})
     except Exception:
         return JsonResponse({'status':'unavailable'},status=503)
+
+@staff_required
+@require_GET
+def browser_diagnostics(request):
+    q = request.GET.get('q','').strip()[:40]
+    records = Attendance.objects.select_related('enrollment__course').order_by('-recorded_at','-pk')
+    if q:
+        records = records.filter(enrollment__student_id=q)
+    records = list(records.prefetch_related(Prefetch('attempt_set',
+        queryset=Attempt.objects.select_related('browser').order_by('opened_at'), to_attr='browser_attempts'))[:100])
+    attempts = [a for r in records for a in r.browser_attempts]
+    evidence = {a.target:a.details for a in Audit.objects.filter(action='QR 브라우저 확인',
+        target__in=[str(a.pk) for a in attempts])}
+    labels = {'missing':'쿠키 미수신','valid':'쿠키 검증 성공','expired':'쿠키 서명 만료',
+              'invalid_signature':'쿠키 서명 불일치','invalid_format':'쿠키 형식 오류'}
+    rows = []
+    for record in records:
+        for attempt in record.browser_attempts or [None]:
+            meta = evidence.get(str(attempt.pk),{}) if attempt else {}
+            rows.append({'record':record,'attempt':attempt,'meta':meta,
+                'cookie_label':labels.get(meta.get('cookie_state'),'진단 추가 전 기록 / 정보 없음')})
+    return render(request,'browser_diagnostics.html',{'rows':rows,'q':q,
+        'diagnostic_version':'2026-10-23-1','cookie_name':settings.BROWSER_COOKIE_NAME,
+        'entries':[{'at':a.created_at,'meta':a.details,'label':labels.get(a.details.get('cookie_state'),'알 수 없음')}
+                   for a in Audit.objects.filter(action='QR 브라우저 확인')[:20]]})

@@ -18,4 +18,5 @@ urlpatterns=[
     path('staff/qr/',v.qr_display,name='qr'),path('staff/qr/data/',v.qr_data,name='qr_data'),
     path('staff/audit/',v.audit_log,name='audit'),path('staff/system/',v.system,name='system'),
     path('staff/accounts/',v.accounts,name='accounts'),path('staff/test-control/',v.sandbox,name='sandbox'),
+    path('staff/browser-diagnostics/',v.browser_diagnostics,name='browser_diagnostics'),
 ]

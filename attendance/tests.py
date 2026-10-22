@@ -104,6 +104,59 @@ class AttendanceTests(TestCase):
         self.assertEqual(first.browser_id,second.browser_id)
         self.assertEqual(second.browser.student_id,self.e.student_id)
 
+    def test_new_browser_session_with_persistent_cookie_keeps_student_binding(self):
+        first=self.enter_browser(self.client)
+        self.assertEqual(self.browser_submit(self.client).status_code,200)
+        restarted=Client()
+        restarted.cookies[settings.BROWSER_COOKIE_NAME]=self.client.cookies[settings.BROWSER_COOKIE_NAME].value
+        second=self.enter_browser(restarted)
+        self.assertEqual(first.browser_id,second.browser_id)
+        self.assertEqual(second.browser.student_id,self.e.student_id)
+        meta=Audit.objects.get(action='QR 브라우저 확인',target=str(second.pk)).details
+        self.assertEqual(meta['cookie_state'],'valid');self.assertTrue(meta['reused'])
+        self.assertFalse(meta['session_cookie_present'])
+        payload=self.payload();payload.update(student_id='999',name='다른학생')
+        self.assertEqual(self.browser_submit(restarted,payload).status_code,400)
+
+    def test_diagnostics_distinguish_missing_and_invalid_cookies_without_secrets(self):
+        first=self.enter_browser(self.client)
+        self.browser_submit(self.client)
+        del self.client.cookies[settings.BROWSER_COOKIE_NAME]
+        second=self.enter_browser(self.client)
+        meta=Audit.objects.get(action='QR 브라우저 확인',target=str(second.pk)).details
+        self.assertEqual(meta['cookie_state'],'missing')
+        self.assertFalse(meta['reused']);self.assertTrue(meta['session_cookie_present'])
+        self.assertEqual(meta['previous_browser_code'],first.browser.support_code)
+        self.assertNotEqual(second.browser_id,first.browser_id)
+        raw=self.client.cookies[settings.BROWSER_COOKIE_NAME].value+'tampered'
+        self.client.cookies[settings.BROWSER_COOKIE_NAME]=raw
+        third=self.enter_browser(self.client)
+        meta=Audit.objects.get(action='QR 브라우저 확인',target=str(third.pk)).details
+        self.assertEqual(meta['cookie_state'],'invalid_signature')
+        self.assertNotIn(raw,json.dumps(meta))
+        self.assertNotIn('ip',meta);self.assertNotIn('token',meta)
+
+    def test_diagnostic_page_staff_only_and_old_records_remain_visible(self):
+        a=self.attempt();svc.submit(a.pk,self.payload())
+        url=reverse('browser_diagnostics')
+        self.assertEqual(self.client.get(url).status_code,302)
+        user=get_user_model().objects.create_user('ordinary',password='Long-password-2026!')
+        self.client.force_login(user)
+        self.assertEqual(self.client.get(url).status_code,403)
+        self.client.force_login(self.staff)
+        response=self.client.get(url)
+        self.assertContains(response,a.browser.support_code)
+        self.assertContains(response,'진단 추가 전 기록')
+        self.assertContains(response,self.e.student_id)
+        self.assertEqual(Attendance.objects.count(),1)
+        self.assertEqual(self.client.post(url,{}).status_code,405)
+
+    def test_expired_cookie_diagnostic(self):
+        self.enter_browser(self.client)
+        with patch('django.core.signing.time.time',return_value=timezone.now().timestamp()+settings.BROWSER_COOKIE_AGE+10):
+            attempt=self.enter_browser(self.client)
+        self.assertEqual(Audit.objects.get(action='QR 브라우저 확인',target=str(attempt.pk)).details['cookie_state'],'expired')
+
     def test_sandbox_reset_removes_bindings_but_scenario_changes_keep_them(self):
         with override_settings(SANDBOX=True):
             a=self.enter_browser(self.client);self.browser_submit(self.client)
