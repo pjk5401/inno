@@ -77,6 +77,8 @@ SESSION_COOKIE_SECURE = not DEBUG
 CSRF_COOKIE_SECURE = not DEBUG
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_REFERRER_POLICY = 'same-origin'
+BROWSER_COOKIE_NAME = 'attendance_test_browser' if SANDBOX else 'attendance_browser'
+BROWSER_COOKIE_AGE = 365 * 24 * 3600
 X_FRAME_OPTIONS = 'DENY'
 # Set only when the school proxy sanitizes this header and direct VM access is restricted.
 if os.getenv('TRUST_PROXY_HTTPS', '0') == '1':

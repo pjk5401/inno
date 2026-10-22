@@ -14,7 +14,7 @@ from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
-from .models import Policy, Course, Enrollment, Attendance, Attempt, Audit, RateBucket
+from .models import Policy, Course, Enrollment, Attendance, Attempt, Audit, RateBucket, BrowserIdentity
 
 class Rejected(ValueError):
     pass
@@ -57,7 +57,7 @@ def qr_token(p=None, expired=False):
     return signing.dumps({'env': settings.SANDBOX, 'generation': p.generation,
                           'start': slot, 'end': slot + p.qr_seconds}, salt='attendance-qr')
 
-def exchange_qr(token):
+def exchange_qr(token, browser_id=None):
     with transaction.atomic():
         p = Policy.objects.select_for_update().get(pk=Policy.current().pk)
         try:
@@ -68,12 +68,18 @@ def exchange_qr(token):
         if (data.get('env') != settings.SANDBOX or data.get('generation') != p.generation
             or not data.get('start', math.inf) <= stamp < data.get('end', -math.inf)):
             raise Rejected('QR이 만료되었거나 테스트가 초기화되었습니다. 최신 QR을 스캔해주세요.')
+        browser = BrowserIdentity.objects.filter(pk=browser_id).first() if browser_id else None
+        if browser is None:
+            browser = BrowserIdentity.objects.create()
         return Attempt.objects.create(generation=p.generation, opened_at=now(p),
+                                      browser=browser, browser_revision=browser.revision,
                                       expires_at=now(p)+timedelta(seconds=p.writing_seconds))
 
 def valid_attempt(attempt, p):
     if not attempt or attempt.generation != p.generation:
         raise Rejected('접속이 초기화되었습니다. 현장의 새 QR을 스캔해주세요.')
+    if not attempt.browser_id or attempt.browser_revision != attempt.browser.revision:
+        raise Rejected('학번 정보가 변경되었습니다. 현장의 새 QR을 스캔해주세요.')
     if now(p) >= attempt.expires_at:
         raise Rejected('작성 시간이 만료되었습니다. 입력을 유지한 채 새 QR을 스캔해주세요.')
 
@@ -151,6 +157,14 @@ def submit(attempt_id, payload):
         with transaction.atomic():
             p = Policy.objects.select_for_update().get(pk=Policy.current().pk)
             attempt = Attempt.objects.select_for_update().filter(pk=attempt_id).first()
+            if not attempt or not attempt.browser_id:
+                raise Rejected('현장의 새 QR을 스캔해주세요.')
+            browser = BrowserIdentity.objects.select_for_update().get(pk=attempt.browser_id)
+            if attempt.browser_revision != browser.revision:
+                raise Rejected('학번 정보가 변경되었습니다. 현장의 새 QR을 스캔해주세요.')
+            sid = str(payload.get('student_id','')).strip()
+            if browser.student_id and browser.student_id != sid:
+                raise Rejected('이 브라우저에 등록된 학번과 다릅니다. 학번 변경은 조교에게 요청해주세요.')
             if attempt and attempt.generation == p.generation and attempt.completed_id:
                 return attempt.completed
             valid_attempt(attempt,p)
@@ -176,6 +190,9 @@ def submit(attempt_id, payload):
             record.signature.save(f'{uuid.uuid4().hex}.png',ContentFile(image),save=False)
             saved_file = record.signature
             record.save()
+            if not browser.student_id:
+                browser.student_id, browser.name = sid, name
+                browser.save(update_fields=['student_id','name','updated_at'])
             attempt.completed = record
             attempt.save(update_fields=['completed'])
             return record
@@ -205,6 +222,7 @@ def reset_sandbox(user=None):
         files = list(Attendance.objects.exclude(signature='').values_list('signature',flat=True))
         storage = Attendance._meta.get_field('signature').storage
         Attempt.objects.all().delete()
+        BrowserIdentity.objects.all().delete()
         Attendance.objects.all().delete()
         Enrollment.objects.all().delete()
         Course.objects.all().delete()

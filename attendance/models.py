@@ -43,12 +43,25 @@ class Enrollment(models.Model):
         ordering = ['student_id']
         constraints = [models.UniqueConstraint(fields=['course','student_id'], name='unique_course_student')]
 
+def browser_code():
+    return uuid.uuid4().hex[:16].upper()
+
+class BrowserIdentity(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    support_code = models.CharField(max_length=16, unique=True, default=browser_code)
+    student_id = models.CharField(max_length=40, blank=True)
+    name = models.CharField(max_length=80, blank=True)
+    revision = models.PositiveIntegerField(default=1)
+    updated_at = models.DateTimeField(auto_now=True)
+
 class Attempt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     generation = models.PositiveIntegerField()
     opened_at = models.DateTimeField()
     expires_at = models.DateTimeField()
     completed = models.ForeignKey('Attendance', null=True, blank=True, on_delete=models.SET_NULL)
+    browser = models.ForeignKey(BrowserIdentity, null=True, on_delete=models.SET_NULL)
+    browser_revision = models.PositiveIntegerField(default=1)
 
 class Attendance(models.Model):
     enrollment = models.OneToOneField(Enrollment, on_delete=models.PROTECT, related_name='attendance')

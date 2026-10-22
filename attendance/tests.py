@@ -11,7 +11,7 @@ from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from django.core.files.uploadedfile import SimpleUploadedFile
-from .models import Policy, Course, Enrollment, Attendance, Attempt, Audit
+from .models import Policy, Course, Enrollment, Attendance, Attempt, Audit, BrowserIdentity
 from . import services as svc
 
 def signature():
@@ -39,6 +39,115 @@ class AttendanceTests(TestCase):
         return svc.exchange_qr(svc.qr_token())
     def attach_attempt(self,attempt):
         session=self.client.session;session['attempt']=str(attempt.pk);session.save()
+        from django.http import HttpResponse
+        response=HttpResponse()
+        response.set_signed_cookie(settings.BROWSER_COOKIE_NAME,str(attempt.browser_id),salt='browser-identity')
+        self.client.cookies[settings.BROWSER_COOKIE_NAME]=response.cookies[settings.BROWSER_COOKIE_NAME]
+
+    def enter_browser(self,client):
+        response=client.get(reverse('enter'),{'q':svc.qr_token()})
+        self.assertEqual(response.status_code,302)
+        return Attempt.objects.get(pk=client.session['attempt'])
+
+    def browser_submit(self,client,payload=None):
+        return client.post(reverse('submit'),json.dumps(payload or self.payload()),content_type='application/json')
+
+    def test_browser_binding_blocks_other_student_but_allows_other_course(self):
+        a=self.enter_browser(self.client)
+        self.assertTrue(self.client.cookies[settings.BROWSER_COOKIE_NAME]['httponly'])
+        self.assertEqual(self.browser_submit(self.client).status_code,200)
+        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,self.e.student_id)
+        Enrollment.objects.create(course=self.c,student_id='999',name='다른학생')
+        second=Course.objects.create(title='다음 수업',starts_at=self.c.starts_at,ends_at=self.c.ends_at)
+        Enrollment.objects.create(course=second,student_id=self.e.student_id,name=self.e.name)
+        b=self.enter_browser(self.client);self.assertEqual(b.browser_id,a.browser_id)
+        response=self.client.get(reverse('checkin'));self.assertContains(response,'readonly')
+        payload=self.payload();payload.update(student_id='999',name='다른학생')
+        rejected=self.browser_submit(self.client,payload)
+        self.assertEqual(rejected.status_code,400)
+        self.assertIn('브라우저',rejected.json()['error'])
+        self.assertEqual(Attendance.objects.count(),1)
+        payload=self.payload();payload['course']=second.pk
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
+        self.assertEqual(Attendance.objects.count(),2)
+
+    def test_failed_submit_does_not_bind_and_cookie_required(self):
+        a=self.enter_browser(self.client)
+        payload=self.payload();payload['signature']=''
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,400)
+        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,'')
+        cookie=self.client.cookies[settings.BROWSER_COOKIE_NAME].value
+        self.client.cookies[settings.BROWSER_COOKIE_NAME]=cookie+'tampered'
+        self.assertEqual(self.browser_submit(self.client).status_code,400)
+        del self.client.cookies[settings.BROWSER_COOKIE_NAME]
+        self.assertEqual(self.browser_submit(self.client).status_code,400)
+        self.assertFalse(Attendance.objects.exists())
+
+    def test_preopened_attempt_uses_latest_binding_and_other_browser_is_independent(self):
+        first=self.enter_browser(self.client)
+        preopened=self.enter_browser(self.client)
+        svc.submit(first.pk,self.payload())
+        Enrollment.objects.create(course=self.c,student_id='999',name='다른학생')
+        payload=self.payload();payload.update(student_id='999',name='다른학생')
+        with self.assertRaisesMessage(svc.Rejected,'브라우저'):
+            svc.submit(preopened.pk,payload)
+        other=Client();other_attempt=self.enter_browser(other)
+        self.assertNotEqual(other_attempt.browser_id,first.browser_id)
+        self.assertEqual(self.browser_submit(other,payload).status_code,200)
+
+    def test_binding_survives_staff_logout_and_new_session(self):
+        first=self.enter_browser(self.client)
+        self.assertEqual(self.browser_submit(self.client).status_code,200)
+        self.client.force_login(self.staff)
+        self.client.post(reverse('logout'))
+        second=self.enter_browser(self.client)
+        self.assertEqual(first.browser_id,second.browser_id)
+        self.assertEqual(second.browser.student_id,self.e.student_id)
+
+    def test_staff_changes_browser_identity_and_revokes_old_attempts(self):
+        a=self.enter_browser(self.client)
+        self.browser_submit(self.client)
+        b=self.enter_browser(self.client)
+        Enrollment.objects.create(course=self.c,student_id='999',name='다른학생')
+        staff=Client();staff.force_login(self.staff)
+        url=reverse('browser_identity')
+        data={'code':a.browser.support_code,'revision':'1','student_id':'999','name':'다른학생','reason':'본인 확인 후 오입력 정정'}
+        self.assertEqual(staff.post(url,data).status_code,302)
+        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,'999')
+        self.assertFalse(self.client.get(reverse('attempt_status')).json()['valid'])
+        self.assertEqual(self.browser_submit(self.client).status_code,400)
+        self.assertEqual(self.client.get(reverse('checkin')).status_code,400)
+        self.assertEqual(Attendance.objects.get().enrollment.student_id,self.e.student_id)
+        self.assertTrue(Audit.objects.filter(actor=self.staff,action='브라우저 학번 변경',details__reason=data['reason']).exists())
+        self.assertContains(staff.post(url,data),'다른 담당자가 변경')
+        self.enter_browser(self.client)
+        payload=self.payload();payload.update(student_id='999',name='다른학생')
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
+
+    def test_browser_identity_change_requires_staff_valid_roster_reason_and_csrf(self):
+        a=self.enter_browser(self.client)
+        url=reverse('browser_identity')
+        data={'code':a.browser.support_code,'revision':'1','student_id':self.e.student_id,'name':self.e.name,'reason':'확인'}
+        self.assertEqual(self.client.post(url,data).status_code,302)
+        staff=Client();staff.force_login(self.staff)
+        self.assertContains(staff.post(url,{**data,'reason':''}),'변경 사유')
+        self.assertContains(staff.post(url,{**data,'name':'없는학생'}),'명단에 등록된')
+        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,'')
+        strict=Client(enforce_csrf_checks=True);strict.force_login(self.staff)
+        self.assertEqual(strict.post(url,data).status_code,403)
+
+    def test_sandbox_reset_removes_bindings_but_scenario_changes_keep_them(self):
+        with override_settings(SANDBOX=True):
+            a=self.enter_browser(self.client);self.browser_submit(self.client)
+            staff=Client();staff.force_login(self.staff)
+            staff.post(reverse('sandbox'),{'action':'normal'})
+            self.assertEqual(BrowserIdentity.objects.get(pk=a.browser_id).student_id,self.e.student_id)
+            self.assertEqual(self.enter_browser(self.client).browser_id,a.browser_id)
+            svc.reset_sandbox(self.admin)
+            self.assertFalse(BrowserIdentity.objects.exists())
+            fresh=self.enter_browser(self.client)
+            self.assertNotEqual(fresh.browser_id,a.browser_id)
+            self.assertEqual(fresh.browser.student_id,'')
 
     def test_time_boundaries(self):
         cases=[(-601,None),(-600,'present'),(900,'present'),(901,'late'),(3599,'late'),(3600,None)]

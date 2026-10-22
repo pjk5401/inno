@@ -4,6 +4,7 @@ import json
 import math
 import shutil
 import zipfile
+import uuid
 from datetime import timedelta
 from functools import wraps
 from pathlib import Path
@@ -23,7 +24,7 @@ from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST, require_GET
-from .models import Policy, Course, Enrollment, Attempt, Attendance, Audit
+from .models import Policy, Course, Enrollment, Attempt, Attendance, Audit, BrowserIdentity
 from .forms import CourseForm, LocationForm, PolicyForm, EnrollmentForm, CorrectionForm
 from . import services as svc
 
@@ -39,12 +40,22 @@ def staff_required(view=None, *, admin=False):
         return inner
     return decorator(view) if view else decorator
 
+def browser_id(request):
+    value = request.get_signed_cookie(settings.BROWSER_COOKIE_NAME, default='', salt='browser-identity', max_age=settings.BROWSER_COOKIE_AGE)
+    try:
+        return uuid.UUID(value)
+    except (ValueError, TypeError):
+        return None
+
 def get_attempt(request):
     value = request.session.get('attempt')
     if not value:
         return None
     try:
-        return Attempt.objects.select_related('completed__enrollment__course').filter(pk=value).first()
+        identity = browser_id(request)
+        if identity is None:
+            return None
+        return Attempt.objects.select_related('completed__enrollment__course','browser').filter(pk=value,browser_id=identity).first()
     except (ValidationError,ValueError):
         return None
 
@@ -56,9 +67,13 @@ def csrf_failure(request, reason=''):
 
 def enter(request):
     try:
-        attempt = svc.exchange_qr(request.GET.get('q',''))
+        attempt = svc.exchange_qr(request.GET.get('q',''), browser_id(request))
         request.session['attempt'] = str(attempt.id)
-        return redirect('checkin')
+        response = redirect('checkin')
+        response.set_signed_cookie(settings.BROWSER_COOKIE_NAME, str(attempt.browser_id), salt='browser-identity',
+            max_age=settings.BROWSER_COOKIE_AGE, path=settings.SESSION_COOKIE_PATH,
+            secure=not settings.DEBUG, httponly=True, samesite='Lax')
+        return response
     except svc.Rejected as e:
         return render(request,'error.html',{'error':str(e)},status=400)
 
@@ -83,7 +98,7 @@ def checkin(request):
             c.available,c.state = False, str(e)
     return render(request,'checkin.html',{'courses':courses,'policy':p,
         'remaining':max(0,int((attempt.expires_at-at).total_seconds())),
-        'generation':p.generation,'mock':settings.SANDBOX and p.location_mode!='real'})
+        'generation':p.generation,'identity':attempt.browser,'mock':settings.SANDBOX and p.location_mode!='real'})
 
 @require_POST
 def submit(request):
@@ -102,15 +117,15 @@ def submit(request):
 def attempt_status(request):
     p = Policy.current()
     attempt = get_attempt(request)
-    valid = bool(attempt and attempt.generation == p.generation)
+    valid = bool(attempt and attempt.generation == p.generation and attempt.browser_id and attempt.browser_revision == attempt.browser.revision)
     remaining = max(0,int((attempt.expires_at-svc.now(p)).total_seconds())) if valid else 0
     return JsonResponse({'valid':valid,'remaining':remaining,'generation':p.generation})
 
 def complete(request):
     attempt = get_attempt(request)
-    if not attempt or attempt.generation != Policy.current().generation or not attempt.completed_id:
+    if not attempt or attempt.generation != Policy.current().generation or not attempt.completed_id or not attempt.browser_id or attempt.browser_revision != attempt.browser.revision:
         return render(request,'error.html',{'error':'출석 완료 기록을 확인할 수 없습니다. 조교에게 문의해주세요.'},status=404)
-    return render(request,'complete.html',{'record':attempt.completed})
+    return render(request,'complete.html',{'record':attempt.completed,'identity':attempt.browser})
 
 def staff_login(request):
     if request.method == 'POST':
@@ -125,6 +140,40 @@ def staff_login(request):
         except svc.Rejected as e:
             messages.error(request,str(e))
     return render(request,'login.html')
+
+@staff_required
+def browser_identity(request):
+    code = (request.POST.get('code','') if request.method == 'POST' else request.GET.get('code','')).strip().upper()
+    identity = BrowserIdentity.objects.filter(support_code=code).first() if code else None
+    if request.method == 'POST':
+        try:
+            sid = request.POST.get('student_id','').strip()
+            name = request.POST.get('name','').strip()
+            reason = request.POST.get('reason','').strip()
+            if not sid or not name or not reason or len(reason)>1000:
+                raise svc.Rejected('학번·이름과 변경 사유(1,000자 이내)를 입력해주세요.')
+            with transaction.atomic():
+                Policy.objects.select_for_update().get(pk=Policy.current().pk)
+                identity = BrowserIdentity.objects.select_for_update().filter(support_code=code).first()
+                if not identity:
+                    raise svc.Rejected('브라우저 확인 코드를 찾을 수 없습니다.')
+                if str(identity.revision) != request.POST.get('revision'):
+                    raise svc.Rejected('다른 담당자가 변경했습니다. 다시 조회해주세요.')
+                if not Enrollment.objects.filter(student_id=sid,name=name).exists():
+                    raise svc.Rejected('명단에 등록된 학번·이름을 입력해주세요.')
+                before = {'student_id':identity.student_id,'name':identity.name}
+                identity.student_id, identity.name = sid, name
+                identity.revision += 1
+                identity.save()
+                svc.audit(request.user,'브라우저 학번 변경',identity.support_code,before=before,
+                          after={'student_id':sid,'name':name},reason=reason)
+            messages.success(request,'학번을 변경했습니다. 학생은 새 QR로 다시 접속해주세요.')
+            return redirect(reverse('browser_identity')+'?code='+code)
+        except svc.Rejected as e:
+            messages.error(request,str(e))
+    elif code and not identity:
+        messages.error(request,'브라우저 확인 코드를 찾을 수 없습니다.')
+    return render(request,'browser_identity.html',{'identity':identity,'code':code})
 
 @require_POST
 def staff_logout(request):
