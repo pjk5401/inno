@@ -16,6 +16,7 @@ from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.core import signing
 from django.core.paginator import Paginator
 from django.db import connection, transaction
 from django.db.models import Q, Count
@@ -24,7 +25,7 @@ from django.shortcuts import render, redirect, get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST, require_GET
-from .models import Policy, Course, Enrollment, Attempt, Attendance, Audit, BrowserIdentity
+from .models import Policy, Course, Enrollment, Attempt, Attendance, Audit
 from .forms import CourseForm, LocationForm, PolicyForm, EnrollmentForm, CorrectionForm
 from . import services as svc
 
@@ -141,40 +142,6 @@ def staff_login(request):
             messages.error(request,str(e))
     return render(request,'login.html')
 
-@staff_required
-def browser_identity(request):
-    code = (request.POST.get('code','') if request.method == 'POST' else request.GET.get('code','')).strip().upper()
-    identity = BrowserIdentity.objects.filter(support_code=code).first() if code else None
-    if request.method == 'POST':
-        try:
-            sid = request.POST.get('student_id','').strip()
-            name = request.POST.get('name','').strip()
-            reason = request.POST.get('reason','').strip()
-            if not sid or not name or not reason or len(reason)>1000:
-                raise svc.Rejected('학번·이름과 변경 사유(1,000자 이내)를 입력해주세요.')
-            with transaction.atomic():
-                Policy.objects.select_for_update().get(pk=Policy.current().pk)
-                identity = BrowserIdentity.objects.select_for_update().filter(support_code=code).first()
-                if not identity:
-                    raise svc.Rejected('브라우저 확인 코드를 찾을 수 없습니다.')
-                if str(identity.revision) != request.POST.get('revision'):
-                    raise svc.Rejected('다른 담당자가 변경했습니다. 다시 조회해주세요.')
-                if not Enrollment.objects.filter(student_id=sid,name=name).exists():
-                    raise svc.Rejected('명단에 등록된 학번·이름을 입력해주세요.')
-                before = {'student_id':identity.student_id,'name':identity.name}
-                identity.student_id, identity.name = sid, name
-                identity.revision += 1
-                identity.save()
-                svc.audit(request.user,'브라우저 학번 변경',identity.support_code,before=before,
-                          after={'student_id':sid,'name':name},reason=reason)
-            messages.success(request,'학번을 변경했습니다. 학생은 새 QR로 다시 접속해주세요.')
-            return redirect(reverse('browser_identity')+'?code='+code)
-        except svc.Rejected as e:
-            messages.error(request,str(e))
-    elif code and not identity:
-        messages.error(request,'브라우저 확인 코드를 찾을 수 없습니다.')
-    return render(request,'browser_identity.html',{'identity':identity,'code':code})
-
 @require_POST
 def staff_logout(request):
     logout(request)
@@ -211,7 +178,25 @@ def course_edit(request,pk=None):
         svc.audit(request.user,'수업 저장',c.pk,before=before,after={'title':c.title,'starts_at':c.starts_at.isoformat(),'ends_at':c.ends_at.isoformat(),'active':c.active})
         messages.success(request,'수업을 저장했습니다. 기존 출석 판정은 변경하지 않습니다.')
         return redirect('course',pk=c.pk)
-    return render(request,'form.html',{'form':form,'title':'수업 수정' if pk else '수업 등록','note':'기록이 있는 수업은 삭제하지 않고 접수 사용을 해제할 수 있습니다.'})
+    return render(request,'form.html',{'form':form,'title':'수업 수정' if pk else '수업 등록','note':''})
+
+@staff_required
+def course_delete(request,pk):
+    course = get_object_or_404(Course,pk=pk)
+    if request.method == 'POST':
+        try:
+            svc.delete_course(pk,request.POST.get('token',''),request.POST.get('confirm',''),
+                              request.POST.get('reason',''),request.user)
+            messages.success(request,'수업과 해당 명단·출석·서명을 삭제했습니다.')
+            return redirect('courses')
+        except svc.Rejected as e:
+            messages.error(request,str(e))
+            course = Course.objects.filter(pk=pk).first()
+            if course is None:
+                return redirect('courses')
+    preview = svc.course_delete_preview(course)
+    return render(request,'course_delete.html',{'course':course,'preview':preview,
+        'token':signing.dumps(preview,salt='course-delete')})
 
 @staff_required
 def course_detail(request,pk):

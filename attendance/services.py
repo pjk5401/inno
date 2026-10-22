@@ -3,6 +3,8 @@ import binascii
 import hashlib
 import hmac
 import io
+import json
+import logging
 import math
 import time
 import uuid
@@ -164,7 +166,7 @@ def submit(attempt_id, payload):
                 raise Rejected('학번 정보가 변경되었습니다. 현장의 새 QR을 스캔해주세요.')
             sid = str(payload.get('student_id','')).strip()
             if browser.student_id and browser.student_id != sid:
-                raise Rejected('이 브라우저에 등록된 학번과 다릅니다. 학번 변경은 조교에게 요청해주세요.')
+                raise Rejected('이 브라우저에 등록된 학번과 다릅니다. 현장에서 조교에게 수동 출석을 요청해주세요.')
             if attempt and attempt.generation == p.generation and attempt.completed_id:
                 return attempt.completed
             valid_attempt(attempt,p)
@@ -206,6 +208,54 @@ def display_status(enrollment, p=None):
         return enrollment.attendance.get_status_display()
     except Attendance.DoesNotExist:
         return '결석' if now(p) >= enrollment.course.ends_at else '미출석'
+
+def course_delete_preview(course):
+    roster = list(course.enrollments.order_by('pk').values())
+    records = list(Attendance.objects.filter(enrollment__course=course).order_by('pk').values())
+    state = {'course': {'id':course.pk,'title':course.title,'section':course.section,
+                       'starts_at':course.starts_at,'ends_at':course.ends_at,'active':course.active},
+             'roster':roster,'records':records}
+    digest = hashlib.sha256(json.dumps(state,sort_keys=True,default=str).encode()).hexdigest()
+    return {'course_id':course.pk,'fingerprint':digest,'students':len(roster),
+            'records':len(records),'signatures':sum(bool(r['signature']) for r in records)}
+
+def delete_course(course_id, token, confirmation, reason, user):
+    try:
+        expected = signing.loads(token, salt='course-delete', max_age=1800)
+    except (signing.BadSignature, ValueError, TypeError):
+        raise Rejected('삭제 확인 화면을 다시 열어주세요.')
+    if not reason.strip() or len(reason)>1000:
+        raise Rejected('삭제 사유를 1,000자 이내로 입력해주세요.')
+    with transaction.atomic():
+        Policy.objects.select_for_update().get(pk=Policy.current().pk)
+        course = Course.objects.select_for_update().filter(pk=course_id).first()
+        if not course:
+            raise Rejected('이미 삭제된 수업입니다.')
+        list(course.enrollments.select_for_update().order_by('pk'))
+        actual = course_delete_preview(course)
+        if expected != actual:
+            raise Rejected('수업이나 출석 기록이 변경되었습니다. 삭제 범위를 다시 확인해주세요.')
+        if confirmation != course.title:
+            raise Rejected('수업명을 정확히 입력해주세요.')
+        records = Attendance.objects.filter(enrollment__course=course)
+        paths = list(records.exclude(signature='').values_list('signature',flat=True))
+        storage = Attendance._meta.get_field('signature').storage
+        Attempt.objects.filter(completed__in=records).delete()
+        records.delete()
+        course.enrollments.all().delete()
+        details = {'title':course.title,'section':course.section,
+                       'starts_at':course.starts_at.isoformat(),'ends_at':course.ends_at.isoformat(),
+                       'students':actual['students'],'records':actual['records'],
+                       'signatures':actual['signatures'],'reason':reason.strip()}
+        course.delete()
+        audit(user,'수업 삭제',course_id,**details)
+        def cleanup():
+            for path in paths:
+                try:
+                    storage.delete(path)
+                except OSError:
+                    logging.getLogger(__name__).exception('Deleted course signature cleanup failed: %s',path)
+        transaction.on_commit(cleanup)
 
 def set_test_time(p, value):
     if not settings.SANDBOX:

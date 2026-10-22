@@ -9,6 +9,7 @@ urlpatterns=[
     path('staff/logout/',v.staff_logout,name='logout'),path('staff/',v.dashboard,name='dashboard'),
     path('staff/courses/',v.courses,name='courses'),path('staff/courses/new/',v.course_edit,name='course_new'),
     path('staff/courses/<int:pk>/',v.course_detail,name='course'),path('staff/courses/<int:pk>/edit/',v.course_edit,name='course_edit'),
+    path('staff/courses/<int:pk>/delete/',v.course_delete,name='course_delete'),
     path('staff/courses/<int:pk>/import/',v.roster_import,name='import'),
     path('staff/courses/<int:course_id>/students/new/',v.enrollment_edit,name='enrollment_new'),
     path('staff/courses/<int:course_id>/students/<int:pk>/',v.enrollment_edit,name='enrollment_edit'),
@@ -17,5 +18,4 @@ urlpatterns=[
     path('staff/qr/',v.qr_display,name='qr'),path('staff/qr/data/',v.qr_data,name='qr_data'),
     path('staff/audit/',v.audit_log,name='audit'),path('staff/system/',v.system,name='system'),
     path('staff/accounts/',v.accounts,name='accounts'),path('staff/test-control/',v.sandbox,name='sandbox'),
-    path('staff/browser-identity/',v.browser_identity,name='browser_identity'),
 ]

@@ -1,0 +1,11 @@
+{% extends 'base.html' %}{% block width %}narrow{% endblock %}{% block content %}
+<div class="page-head"><h1>수업 삭제</h1><p>{{ course }} · {{ course.starts_at|date:'Y.m.d H:i' }}–{{ course.ends_at|date:'H:i' }}</p></div>
+<section class="card danger-zone stack">
+<dl><dt>학생 명단</dt><dd>{{ preview.students }}명</dd><dt>출석 기록</dt><dd>{{ preview.records }}건</dd><dt>서명</dt><dd>{{ preview.signatures }}개</dd></dl>
+<p>위 자료가 함께 삭제되며 화면에서 복구할 수 없습니다. 다른 수업과 삭제 이력은 유지됩니다. 기존 백업 파일에는 삭제 전 자료가 남을 수 있습니다.</p>
+<div class="toolbar"><a href="{% url 'export' %}?course={{ course.pk }}">간단 엑셀</a><a href="{% url 'export' %}?course={{ course.pk }}&signatures=1">서명 엑셀</a></div>
+<form method="post" class="stack">{% csrf_token %}<input type="hidden" name="token" value="{{ token }}">
+<label>삭제 사유<textarea name="reason" maxlength="1000" required></textarea></label>
+<label>확인을 위해 수업명 입력<input name="confirm" required autocomplete="off" placeholder="{{ course.title }}"></label>
+<button class="danger">수업과 기록 삭제</button><a class="button secondary" href="{% url 'course' course.pk %}">취소</a></form>
+</section>{% endblock %}

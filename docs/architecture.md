@@ -40,7 +40,7 @@ PostgreSQL 운영/테스트 DB에서 PUBLIC CONNECT를 제거하고 각각 독�
 
 브라우저 학번 등록은 `BrowserIdentity`에 저장한다. QR 교환 시 서명된 임의 UUID 쿠키를 발급하며, 학번 자체를 쿠키에 담지 않는다. HttpOnly·SameSite=Lax·운영 Secure 속성, 1년 유효기간, 운영/테스트별 이름·경로를 사용한다. 담당자 로그아웃과 출석 세션 만료로는 등록이 해제되지 않는다. 출석 시 쿠키 소유자와 Attempt 소유자를 확인하고, 트랜잭션 안에서 브라우저 행을 잠가 최초 성공한 학번만 등록한다.
 
-조교는 별도의 확인 코드로 브라우저를 찾는다. 변경 시 명단 일치·사유·권한·CSRF·revision을 검사하고 revision을 증가시켜 이전 Attempt를 폐기한다. 브라우저 학번 변경과 출석 제출은 같은 Policy→BrowserIdentity 잠금 순서를 사용한다. 테스트 전체 초기화는 등록도 삭제한다. 마이그레이션 이전의 작성 세션은 새 QR 접속이 필요하며, 기존 출석 기록은 보존한다.
+브라우저 학번 변경 웹 경로는 제공하지 않는다. 예외는 조교가 기존 수동 출석·정정 기능에서 처리하며 브라우저 등록을 해제하지 않는다. 기존 데이터 호환성을 위해 브라우저 revision 필드는 유지한다. 테스트 전체 초기화는 등록도 삭제한다. 마이그레이션 이전의 작성 세션은 새 QR 접속이 필요하며, 기존 출석 기록은 보존한다.
 
 1. 확정 요구사항/화면/예외 규칙 문서화.
 2. 모델·권한·시간·QR·위치·중복 방지 구현.
@@ -59,3 +59,7 @@ PostgreSQL 운영/테스트 DB에서 PUBLIC CONNECT를 제거하고 각각 독�
 - Geolocation: https://www.w3.org/TR/geolocation/
 - openpyxl: https://openpyxl.readthedocs.io/en/stable/images.html
 - Signature Pad: https://github.com/szimek/signature_pad
+
+## 수업 삭제
+
+관리자·조교 전용 확인 화면에서 삭제 대상 수와 엑셀 다운로드를 제공한다. POST에 CSRF·수업명·사유와 30분 유효 서명 토큰을 요구한다. 토큰은 수업·명단·출석 내용의 지문을 포함한다. Policy→Course→Enrollment 순으로 행을 잠근 뒤 최신 지문을 비교하여 미리보기 이후 추가·수정된 기록의 무심코 삭제를 막는다. 삭제와 감사 이력 저장은 하나의 트랜잭션이며 서명 파일은 커밋 후 제거한다. 파일 정리 실패는 서버 로그에 남긴다. 실제 PostgreSQL 동시성 검증은 VM에서 수행한다.

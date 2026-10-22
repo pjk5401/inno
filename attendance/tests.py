@@ -104,38 +104,6 @@ class AttendanceTests(TestCase):
         self.assertEqual(first.browser_id,second.browser_id)
         self.assertEqual(second.browser.student_id,self.e.student_id)
 
-    def test_staff_changes_browser_identity_and_revokes_old_attempts(self):
-        a=self.enter_browser(self.client)
-        self.browser_submit(self.client)
-        b=self.enter_browser(self.client)
-        Enrollment.objects.create(course=self.c,student_id='999',name='다른학생')
-        staff=Client();staff.force_login(self.staff)
-        url=reverse('browser_identity')
-        data={'code':a.browser.support_code,'revision':'1','student_id':'999','name':'다른학생','reason':'본인 확인 후 오입력 정정'}
-        self.assertEqual(staff.post(url,data).status_code,302)
-        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,'999')
-        self.assertFalse(self.client.get(reverse('attempt_status')).json()['valid'])
-        self.assertEqual(self.browser_submit(self.client).status_code,400)
-        self.assertEqual(self.client.get(reverse('checkin')).status_code,400)
-        self.assertEqual(Attendance.objects.get().enrollment.student_id,self.e.student_id)
-        self.assertTrue(Audit.objects.filter(actor=self.staff,action='브라우저 학번 변경',details__reason=data['reason']).exists())
-        self.assertContains(staff.post(url,data),'다른 담당자가 변경')
-        self.enter_browser(self.client)
-        payload=self.payload();payload.update(student_id='999',name='다른학생')
-        self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
-
-    def test_browser_identity_change_requires_staff_valid_roster_reason_and_csrf(self):
-        a=self.enter_browser(self.client)
-        url=reverse('browser_identity')
-        data={'code':a.browser.support_code,'revision':'1','student_id':self.e.student_id,'name':self.e.name,'reason':'확인'}
-        self.assertEqual(self.client.post(url,data).status_code,302)
-        staff=Client();staff.force_login(self.staff)
-        self.assertContains(staff.post(url,{**data,'reason':''}),'변경 사유')
-        self.assertContains(staff.post(url,{**data,'name':'없는학생'}),'명단에 등록된')
-        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,'')
-        strict=Client(enforce_csrf_checks=True);strict.force_login(self.staff)
-        self.assertEqual(strict.post(url,data).status_code,403)
-
     def test_sandbox_reset_removes_bindings_but_scenario_changes_keep_them(self):
         with override_settings(SANDBOX=True):
             a=self.enter_browser(self.client);self.browser_submit(self.client)
@@ -148,6 +116,83 @@ class AttendanceTests(TestCase):
             fresh=self.enter_browser(self.client)
             self.assertNotEqual(fresh.browser_id,a.browser_id)
             self.assertEqual(fresh.browser.student_id,'')
+
+    def test_student_has_no_identity_change_and_staff_handles_exception_manually(self):
+        a=self.enter_browser(self.client)
+        self.assertNotContains(self.client.get(reverse('checkin')),'학번 변경')
+        self.browser_submit(self.client)
+        self.assertNotContains(self.client.get(reverse('complete')),'학번 변경')
+        row=Enrollment.objects.create(course=self.c,student_id='999',name='다른학생')
+        staff=Client();staff.force_login(self.staff)
+        self.assertEqual(staff.get(settings.URL_PREFIX+'/staff/browser-identity/').status_code,404)
+        response=staff.post(reverse('record',args=[row.pk]),{'status':'present',
+            'attended_at':timezone.localtime(self.at).strftime('%Y-%m-%dT%H:%M'),
+            'reason':'현장에서 본인 확인 후 수동 출석','revision':'new'})
+        self.assertEqual(response.status_code,302)
+        record=Attendance.objects.get(enrollment=row)
+        self.assertEqual(record.method,'manual');self.assertFalse(record.signature)
+        a.browser.refresh_from_db();self.assertEqual(a.browser.student_id,self.e.student_id)
+        self.assertTrue(Audit.objects.filter(actor=self.staff,action='출석 정정',target=str(row.pk)).exists())
+
+    def test_course_delete_removes_only_target_records_and_signatures_after_commit(self):
+        a=self.attempt();record=svc.submit(a.pk,self.payload())
+        path=record.signature.name;storage=record.signature.storage
+        other=Course.objects.create(title='보존 수업',starts_at=self.c.starts_at,ends_at=self.c.ends_at)
+        other_row=Enrollment.objects.create(course=other,student_id='999',name='다른학생')
+        payload=self.payload();payload.update(course=other.pk,student_id='999',name='다른학생')
+        other_record=svc.submit(self.attempt().pk,payload)
+        self.client.force_login(self.admin)
+        url=reverse('course_delete',args=[self.c.pk])
+        preview=self.client.get(url)
+        self.assertEqual(preview.context['preview']['signatures'],1)
+        self.assertTrue(Course.objects.filter(pk=self.c.pk).exists())
+        with self.captureOnCommitCallbacks(execute=True):
+            response=self.client.post(url,{'token':preview.context['token'],'confirm':self.c.title,'reason':'잘못 등록한 수업 삭제'})
+            self.assertEqual(response.status_code,302)
+            self.assertTrue(storage.exists(path))
+        self.assertFalse(storage.exists(path))
+        self.assertFalse(Course.objects.filter(pk=self.c.pk).exists())
+        self.assertFalse(Enrollment.objects.filter(pk=self.e.pk).exists())
+        self.assertFalse(Attendance.objects.filter(pk=record.pk).exists())
+        self.assertFalse(Attempt.objects.filter(pk=a.pk).exists())
+        self.assertTrue(Attendance.objects.filter(pk=other_record.pk).exists())
+        self.assertTrue(other_record.signature.storage.exists(other_record.signature.name))
+        self.assertTrue(BrowserIdentity.objects.filter(pk=a.browser_id).exists())
+        log=Audit.objects.get(action='수업 삭제',target=str(self.c.pk))
+        self.assertEqual(log.details['signatures'],1);self.assertEqual(log.actor,self.admin)
+        self.assertEqual(self.client.post(url,{}).status_code,404)
+
+    def test_course_delete_requires_staff_csrf_confirmation_reason_and_fresh_preview(self):
+        url=reverse('course_delete',args=[self.c.pk])
+        self.assertEqual(self.client.get(url).status_code,302)
+        self.assertEqual(self.client.post(url,{}).status_code,302)
+        self.client.force_login(self.staff)
+        token=self.client.get(url).context['token']
+        payload={'token':token,'confirm':self.c.title,'reason':'등록 실수'}
+        strict=Client(enforce_csrf_checks=True);strict.force_login(self.admin)
+        self.assertEqual(strict.post(url,payload).status_code,403)
+        for update in [{'token':'bad'},{'confirm':'다른 수업'},{'reason':''}]:
+            self.assertEqual(self.client.post(url,{**payload,**update}).status_code,200)
+            self.assertTrue(Course.objects.filter(pk=self.c.pk).exists())
+        svc.submit(self.attempt().pk,self.payload())
+        self.assertContains(self.client.post(url,payload),'삭제 범위를 다시 확인')
+        self.assertTrue(Course.objects.filter(pk=self.c.pk).exists())
+
+    def test_assistant_can_delete_empty_course_and_rollback_preserves_files(self):
+        from django.core import signing
+        record=svc.submit(self.attempt().pk,self.payload())
+        token=signing.dumps(svc.course_delete_preview(self.c),salt='course-delete')
+        with patch('attendance.services.audit',side_effect=RuntimeError('audit unavailable')):
+            with self.assertRaises(RuntimeError):
+                svc.delete_course(self.c.pk,token,self.c.title,'실수',self.staff)
+        self.assertTrue(Course.objects.filter(pk=self.c.pk).exists())
+        self.assertTrue(record.signature.storage.exists(record.signature.name))
+        empty=Course.objects.create(title='빈 수업',starts_at=self.c.starts_at,ends_at=self.c.ends_at)
+        self.client.force_login(self.staff)
+        url=reverse('course_delete',args=[empty.pk])
+        token=self.client.get(url).context['token']
+        self.assertEqual(self.client.post(url,{'token':token,'confirm':empty.title,'reason':'중복 등록'}).status_code,302)
+        self.assertFalse(Course.objects.filter(pk=empty.pk).exists())
 
     def test_time_boundaries(self):
         cases=[(-601,None),(-600,'present'),(900,'present'),(901,'late'),(3599,'late'),(3600,None)]
