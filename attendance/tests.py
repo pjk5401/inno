@@ -352,9 +352,17 @@ class AttendanceTests(TestCase):
     def test_checkin_and_completed_flow(self):
         self.attach_attempt(self.attempt())
         response=self.client.get(reverse('checkin'));self.assertEqual(response.status_code,200)
+        self.assertContains(response,'<legend>소속</legend>')
+        self.assertContains(response,'소프트웨어대학');self.assertContains(response,'그 외')
+        for removed in ['담당자 로그인','남은 시간','id="check-location"','id="location-status"']:
+            self.assertNotContains(response,removed)
         response=self.client.post(reverse('submit'),data=json.dumps(self.payload()),content_type='application/json')
         self.assertEqual(response.status_code,200)
         response=self.client.get(reverse('complete'));self.assertContains(response,'출석 완료')
+        self.assertNotContains(response,'다른 수업 출석')
+        self.assertNotContains(response,'담당자 로그인')
+        self.assertContains(response,'위도 35.1')
+        self.assertContains(response,'경도 129.0')
 
     def test_submission_requires_csrf(self):
         client=Client(enforce_csrf_checks=True)
