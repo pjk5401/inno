@@ -11,7 +11,6 @@ class Policy(models.Model):
     max_accuracy = models.PositiveIntegerField(default=150, validators=[MinValueValidator(1), MaxValueValidator(10000)])
     before_minutes = models.PositiveIntegerField(default=10, validators=[MaxValueValidator(180)])
     late_minutes = models.PositiveIntegerField(default=15, validators=[MaxValueValidator(180)])
-    qr_seconds = models.PositiveIntegerField(default=60, validators=[MinValueValidator(15), MaxValueValidator(300)])
     writing_seconds = models.PositiveIntegerField(default=300, validators=[MinValueValidator(30), MaxValueValidator(1800)])
     generation = models.PositiveIntegerField(default=1)
     test_time = models.DateTimeField(null=True, blank=True)
@@ -64,7 +63,11 @@ class Attempt(models.Model):
     browser_revision = models.PositiveIntegerField(default=1)
 
 class Attendance(models.Model):
-    enrollment = models.OneToOneField(Enrollment, on_delete=models.PROTECT, related_name='attendance')
+    enrollment = models.OneToOneField(Enrollment, null=True, blank=True, on_delete=models.PROTECT, related_name='attendance')
+    guest_date = models.DateField(null=True, blank=True)
+    department = models.CharField('학과', max_length=100, blank=True)
+    student_id = models.CharField('학번', max_length=40, blank=True)
+    name = models.CharField('이름', max_length=80, blank=True)
     status = models.CharField(max_length=10, choices=[('present','출석'),('late','지각'),('absent','결석')])
     attended_at = models.DateTimeField(null=True, blank=True)
     recorded_at = models.DateTimeField(auto_now_add=True)
@@ -77,6 +80,21 @@ class Attendance(models.Model):
     location_source = models.CharField(max_length=20, blank=True)
     policy_snapshot = models.JSONField(default=dict)
     reason = models.TextField(blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['guest_date','student_id'], condition=models.Q(enrollment__isnull=True), name='unique_guest_day_student'),
+            models.CheckConstraint(condition=(models.Q(enrollment__isnull=False,guest_date__isnull=True) |
+                (models.Q(enrollment__isnull=True,guest_date__isnull=False) & ~models.Q(department='') & ~models.Q(student_id='') & ~models.Q(name=''))), name='attendance_roster_or_guest'),
+        ]
+
+    @property
+    def display_student_id(self):
+        return self.enrollment.student_id if self.enrollment_id else self.student_id
+
+    @property
+    def display_name(self):
+        return self.enrollment.name if self.enrollment_id else self.name
 
 class Audit(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)

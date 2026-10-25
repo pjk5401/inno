@@ -26,7 +26,7 @@ from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_POST, require_GET
 from .models import Policy, Course, Enrollment, Attempt, Attendance, Audit
-from .forms import CourseForm, LocationForm, PolicyForm, EnrollmentForm, CorrectionForm
+from .forms import CourseForm, LocationForm, PolicyForm, EnrollmentForm, CorrectionForm, GuestCorrectionForm
 from . import services as svc
 
 def staff_required(view=None, *, admin=False):
@@ -73,7 +73,7 @@ def home(request):
     return render(request,'home.html')
 
 def csrf_failure(request, reason=''):
-    return render(request,'error.html',{'error':'접속 정보가 만료되었거나 요청 출처를 확인하지 못했습니다. 화면을 새로고침하거나 최신 QR로 다시 접속해주세요.'},status=403)
+    return render(request,'error.html',{'error':'접속 정보가 만료되었거나 요청 출처를 확인하지 못했습니다. 화면을 새로고침하거나 고정 QR로 다시 접속해주세요.'},status=403)
 
 def enter(request):
     try:
@@ -84,7 +84,7 @@ def enter(request):
         except (ValidationError,ValueError):
             pass
         with transaction.atomic():
-            attempt = svc.exchange_qr(request.GET.get('q',''), identity)
+            attempt = svc.exchange_qr(browser_id=identity)
             # Diagnostic classifications only: never store cookie values, QR tokens or IPs.
             svc.audit(None,'QR 브라우저 확인',attempt.pk,
                 cookie_state=cookie_state, browser_code=attempt.browser.support_code,
@@ -102,6 +102,23 @@ def enter(request):
     except svc.Rejected as e:
         return render(request,'error.html',{'error':str(e)},status=400)
 
+def clock_data(p=None):
+    actual = timezone.now()
+    return {'server_time':actual.isoformat(), 'attendance_time':svc.now(p).isoformat(), 'sandbox':settings.SANDBOX}
+
+
+@require_GET
+def clock(request):
+    return JsonResponse(clock_data())
+
+
+def available_courses(p):
+    at = svc.now(p)
+    rows = Course.objects.filter(active=True,starts_at__lte=at+timedelta(minutes=p.before_minutes),ends_at__gt=at)
+    return [{'id':c.pk,'label':f'{c} · {timezone.localtime(c.starts_at):%H:%M}–{timezone.localtime(c.ends_at):%H:%M} · '+
+             {'present':'출석 접수','late':'지각 접수'}[svc.course_status(c,p,at)]} for c in rows]
+
+
 def checkin(request):
     p = Policy.current()
     attempt = get_attempt(request)
@@ -112,15 +129,7 @@ def checkin(request):
     if attempt.completed_id:
         return redirect('complete')
     at = svc.now(p)
-    day = timezone.localtime(at).date()
-    courses = list(Course.objects.filter(Q(starts_at__date=day) |
-        Q(starts_at__lte=at+timedelta(minutes=p.before_minutes),ends_at__gt=at)))
-    for c in courses:
-        try:
-            c.available = True
-            c.state = {'present':'출석 접수','late':'지각 접수'}[svc.course_status(c,p,at)]
-        except svc.Rejected as e:
-            c.available,c.state = False, str(e)
+    courses = available_courses(p)
     return render(request,'checkin.html',{'courses':courses,'policy':p,
         'remaining':max(0,int((attempt.expires_at-at).total_seconds())),
         'generation':p.generation,'identity':attempt.browser,'mock':settings.SANDBOX and p.location_mode!='real'})
@@ -144,7 +153,7 @@ def attempt_status(request):
     attempt = get_attempt(request)
     valid = bool(attempt and attempt.generation == p.generation and attempt.browser_id and attempt.browser_revision == attempt.browser.revision)
     remaining = max(0,int((attempt.expires_at-svc.now(p)).total_seconds())) if valid else 0
-    return JsonResponse({'valid':valid,'remaining':remaining,'generation':p.generation})
+    return JsonResponse({'valid':valid,'remaining':remaining,'generation':p.generation,'courses':available_courses(p),**clock_data(p)})
 
 def complete(request):
     attempt = get_attempt(request)
@@ -380,6 +389,93 @@ def safe_cell(value):
         return "'"+value
     return value
 
+
+def guest_rows(request):
+    rows = Attendance.objects.filter(enrollment__isnull=True).order_by('-guest_date','-attended_at','-pk')
+    date = request.GET.get('date','')
+    q = request.GET.get('q','').strip()[:100]
+    if date:
+        from datetime import date as date_type
+        try:
+            rows = rows.filter(guest_date=date_type.fromisoformat(date))
+        except ValueError:
+            rows = rows.none()
+    if q:
+        rows = rows.filter(Q(department__icontains=q)|Q(student_id__icontains=q)|Q(name__icontains=q))
+    return rows
+
+
+@staff_required
+def guests(request):
+    return render(request,'guests.html',{'rows':Paginator(guest_rows(request),100).get_page(request.GET.get('page')),
+        'date':request.GET.get('date',''),'q':request.GET.get('q','')})
+
+
+@staff_required
+def guest_record(request,pk=None):
+    record = get_object_or_404(Attendance,enrollment__isnull=True,pk=pk) if pk else None
+    at = timezone.localtime(svc.now())
+    initial = {'status':'present','guest_date':at.date(),'attended_at':at,'revision':'new'}
+    if record:
+        initial.update({k:getattr(record,k) for k in ['department','student_id','name','guest_date','status','attended_at']})
+        initial['revision'] = guest_revision(record)
+    form = GuestCorrectionForm(request.POST or None,initial=initial)
+    if request.method == 'POST' and form.is_valid():
+        with transaction.atomic():
+            Policy.objects.select_for_update().get(pk=Policy.current().pk)
+            record = Attendance.objects.select_for_update().filter(pk=pk,enrollment__isnull=True).first() if pk else None
+            data = form.cleaned_data
+            if (pk and not record) or data['revision'] != guest_revision(record):
+                form.add_error(None,'기록이 변경되었습니다. 화면을 다시 열어주세요.')
+            elif Attendance.objects.filter(enrollment__isnull=True,guest_date=data['guest_date'],student_id=data['student_id']).exclude(pk=pk).exists():
+                form.add_error(None,'해당 날짜·학번의 출석이 이미 있습니다.')
+            else:
+                before = {k:str(getattr(record,k)) for k in ['department','student_id','name','guest_date','status','attended_at','reason']} if record else {}
+                record = record or Attendance()
+                for k in ['department','student_id','name','guest_date','status','attended_at','reason']:
+                    setattr(record,k,data[k])
+                record.method='manual';record.save()
+                svc.audit(request.user,'타 학과 출석 정정',record.pk,before=before,
+                    after={k:str(getattr(record,k)) for k in ['department','student_id','name','guest_date','status','attended_at','reason']})
+                messages.success(request,'타 학과 출석을 저장했습니다.')
+                return redirect('guest_record',pk=record.pk)
+    return render(request,'guest_record.html',{'record':record,'form':form,
+        'history':Audit.objects.filter(action='타 학과 출석 정정',target=str(pk))[:30] if pk else []})
+
+
+def guest_revision(record):
+    if not record:
+        return 'new'
+    import hashlib
+    return hashlib.sha256(json.dumps({k:str(getattr(record,k)) for k in
+        ['department','student_id','name','guest_date','status','attended_at','reason','method']},sort_keys=True).encode()).hexdigest()
+
+
+@staff_required
+def guest_export(request):
+    include = request.GET.get('signatures') == '1'
+    book=openpyxl.Workbook();sheet=book.active;sheet.title='타 학과 출석'
+    sheet.append(['일자','학과','학번','이름','출석상태','출석시간','처리방식','환경','서명 시 이름']+(['서명'] if include else []))
+    for num,r in enumerate(guest_rows(request),2):
+        sheet.append([safe_cell(v) for v in [r.guest_date.isoformat(),r.department,r.student_id,r.name,r.get_status_display(),
+            timezone.localtime(r.attended_at).strftime('%Y-%m-%d %H:%M:%S') if r.attended_at else '',r.get_method_display(),
+            ('테스트 · '+r.location_source) if settings.SANDBOX else '운영',r.signed_name]+([''] if include else [])])
+        sheet.cell(num,3).number_format='@'
+        if include and r.signature:
+            with r.signature.open('rb') as f:
+                img=ExcelImage(io.BytesIO(f.read()))
+            ratio=min(190/img.width,65/img.height);img.width*=ratio;img.height*=ratio
+            sheet.add_image(img,f'J{num}');sheet.row_dimensions[num].height=55
+    from openpyxl.styles import Font,PatternFill
+    for cell in sheet[1]:
+        cell.font=Font(bold=True,color='FFFFFF');cell.fill=PatternFill('solid',fgColor='176A53')
+    for col,width in {'A':14,'B':24,'C':18,'D':16,'E':12,'F':23,'G':14,'H':22,'I':18,'J':29}.items():
+        sheet.column_dimensions[col].width=width
+    sheet.freeze_panes='A2';sheet.auto_filter.ref=sheet.dimensions
+    out=io.BytesIO();book.save(out);out.seek(0)
+    svc.audit(request.user,'타 학과 출석부 다운로드','guests',signatures=include,date=request.GET.get('date',''))
+    return FileResponse(out,as_attachment=True,filename=('test-' if settings.SANDBOX else '')+('guest-signatures.xlsx' if include else 'guest-attendance.xlsx'))
+
 @staff_required
 def export(request):
     courses=Course.objects.all()
@@ -433,19 +529,17 @@ def location(request):
 
 @staff_required
 def qr_display(request):
-    return render(request,'qr.html',{'expired':settings.SANDBOX and request.GET.get('expired')=='1'})
+    return render(request,'qr.html')
 
 @staff_required
 def qr_data(request):
-    p=Policy.current();at=svc.now(p)
-    expired=settings.SANDBOX and request.GET.get('expired')=='1'
-    token=svc.qr_token(p,expired)
-    from urllib.parse import urlencode
-    url=settings.PUBLIC_ORIGIN+reverse('enter')+'?'+urlencode({'q':token})
-    buf=io.BytesIO();qrcode.make(url,box_size=8,border=3).save(buf,format='PNG')
-    return JsonResponse({'image':'data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode(),
-        'url':url,'remaining':p.qr_seconds-int(at.timestamp())%p.qr_seconds,'clock':timezone.localtime(at).strftime('%Y-%m-%d %H:%M:%S'),
-        'mode':p.get_location_mode_display() if settings.SANDBOX else '', 'expired':expired})
+    url=settings.PUBLIC_ORIGIN+reverse('enter')
+    buf=io.BytesIO();qrcode.make(url,box_size=12,border=4).save(buf,format='PNG')
+    if request.GET.get('download') == '1':
+        buf.seek(0)
+        return FileResponse(buf,as_attachment=True,filename=('test-' if settings.SANDBOX else '')+'attendance-qr.png')
+    return JsonResponse({'image':'data:image/png;base64,'+base64.b64encode(buf.getvalue()).decode(), 'url':url})
+
 
 @staff_required
 def audit_log(request):
@@ -549,7 +643,7 @@ def sandbox(request):
                     else:
                         raise svc.Rejected('지원하지 않는 시나리오입니다.')
                     svc.audit(request.user,'테스트 시나리오',action)
-            messages.success(request,'테스트 상황을 준비했습니다. 시간 시나리오를 바꿨다면 새 QR로 접속해주세요.')
+            messages.success(request,'테스트 상황을 준비했습니다. 시간 시나리오를 바꿨다면 고정 QR로 접속해주세요.')
             return redirect('sandbox')
         except svc.Rejected as e:
             messages.error(request,str(e))
@@ -572,7 +666,7 @@ def browser_diagnostics(request):
     q = request.GET.get('q','').strip()[:40]
     records = Attendance.objects.select_related('enrollment__course').order_by('-recorded_at','-pk')
     if q:
-        records = records.filter(enrollment__student_id=q)
+        records = records.filter(Q(enrollment__student_id=q)|Q(enrollment__isnull=True,student_id=q))
     records = list(records.prefetch_related(Prefetch('attempt_set',
         queryset=Attempt.objects.select_related('browser').order_by('opened_at'), to_attr='browser_attempts'))[:100])
     attempts = [a for r in records for a in r.browser_attempts]

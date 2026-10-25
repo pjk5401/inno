@@ -7,3 +7,5 @@ APP_ENV=live python manage.py test attendance --noinput
 APP_ENV=sandbox python manage.py test attendance --noinput
 python scripts/test_archive.py
 bash -n manage.sh deploy/init-db.sh
+
+if command -v node >/dev/null 2>&1; then node scripts/test_checkin.cjs; fi

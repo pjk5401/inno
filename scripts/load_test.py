@@ -49,6 +49,7 @@ def main():
     base=origin+'/test/'
     print('대상:',base,'가상 제출:',args.users,'동시 작업:',args.workers)
     print('먼저 테스트 관리 화면에서 전체 초기화하세요. 운영 데이터는 접근하지 않습니다.')
+    print('이 HTTP 시험은 테스트 위치 모드를 모의 구역 안으로 변경하고 합성 좌표를 보냅니다. 실제 위치 권한 시험은 휴대폰에서 별도로 진행하세요.')
     if input('테스트 출석 기록을 생성할까요? TEST 입력: ')!='TEST':return
     admin=client();page=request(admin,base+'staff/login/').read().decode()
     if '테스트 환경' not in page:raise RuntimeError('테스트 환경 표시를 확인하지 못했습니다.')
@@ -60,6 +61,7 @@ def main():
     if '/login/' in response.url:raise RuntimeError('로그인 실패')
     page=request(admin,base+'staff/test-control/').read().decode();fields=Fields();fields.feed(page)
     request(admin,base+'staff/test-control/',{'csrfmiddlewaretoken':fields.csrf,'action':'normal'},origin).read()
+    request(admin,base+'staff/test-control/',{'csrfmiddlewaretoken':fields.csrf,'action':'location','mode':'inside'},origin).read()
     qr=json.load(request(admin,base+'staff/qr/data/'))
     probe=client();page=request(probe,qr['url']).read().decode();fields=Fields();fields.feed(page)
     courses=fields.courses
@@ -72,7 +74,7 @@ def main():
         try:
             page=request(opener,qr['url']).read().decode();f=Fields();f.feed(page)
             sid=index%70+1
-            payload={'course':courses[index//70],'student_id':f'2026{sid:04}','name':f'가상학생{sid:02}','signature':sig}
+            payload={'course':courses[index//70],'student_id':f'2026{sid:04}','name':f'가상학생{sid:02}','signature':sig,'latitude':35.1,'longitude':129.0,'accuracy':20,'location_timestamp':time.time()*1000}
             req=urllib.request.Request(base+'checkin/submit/',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','X-CSRFToken':f.csrf,'Origin':origin})
             data=json.load(opener.open(req,timeout=100))
             return bool(data.get('ok')),time.perf_counter()-started,''

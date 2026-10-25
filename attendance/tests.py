@@ -36,7 +36,7 @@ class AttendanceTests(TestCase):
         return {'course':self.c.pk,'student_id':self.e.student_id,'name':self.e.name,'signature':signature(),
                 'latitude':35.1,'longitude':129.0,'accuracy':20,'location_timestamp':timezone.now().timestamp()*1000}
     def attempt(self):
-        return svc.exchange_qr(svc.qr_token())
+        return svc.exchange_qr()
     def attach_attempt(self,attempt):
         session=self.client.session;session['attempt']=str(attempt.pk);session.save()
         from django.http import HttpResponse
@@ -45,7 +45,7 @@ class AttendanceTests(TestCase):
         self.client.cookies[settings.BROWSER_COOKIE_NAME]=response.cookies[settings.BROWSER_COOKIE_NAME]
 
     def enter_browser(self,client):
-        response=client.get(reverse('enter'),{'q':svc.qr_token()})
+        response=client.get(reverse('enter'))
         self.assertEqual(response.status_code,302)
         return Attempt.objects.get(pk=client.session['attempt'])
 
@@ -267,14 +267,19 @@ class AttendanceTests(TestCase):
         with self.assertRaisesMessage(svc.Rejected,'이미 처리된'):svc.submit(self.attempt().pk,self.payload())
         record.refresh_from_db();self.assertEqual(record.status,'present')
 
-    def test_expired_and_tampered_qr(self):
-        for token in [svc.qr_token(expired=True),svc.qr_token()+'x','bad']:
-            with self.assertRaises(svc.Rejected):svc.exchange_qr(token)
-
-    def test_cross_environment_qr_rejected(self):
-        token=svc.qr_token()
-        with override_settings(SANDBOX=not settings.SANDBOX):
-            with self.assertRaises(svc.Rejected):svc.exchange_qr(token)
+    def test_fixed_qr_and_download_stay_identical_after_time_and_reset(self):
+        self.client.force_login(self.staff)
+        original=self.client.get(reverse('qr_data')).json()
+        self.assertEqual(original['url'],settings.PUBLIC_ORIGIN+reverse('enter'))
+        with override_settings(SANDBOX=True):
+            svc.reset_sandbox(self.admin)
+            self.p.refresh_from_db()
+            svc.set_test_time(self.p,svc.now(self.p)+timedelta(days=3))
+            self.assertEqual(self.client.get(reverse('qr_data')).json(),original)
+        response=self.client.get(reverse('qr_data'),{'download':'1'})
+        self.assertEqual(response['Content-Type'],'image/png')
+        self.assertTrue(b''.join(response.streaming_content).startswith(b'\x89PNG'))
+        self.assertEqual(self.client.get(reverse('enter')).status_code,302)
 
     def test_writing_expired(self):
         a=self.attempt();a.expires_at=svc.now()-timedelta(seconds=1);a.save()
@@ -311,19 +316,20 @@ class AttendanceTests(TestCase):
     def test_sandbox_reset_revokes_sessions_and_preserves_accounts(self):
         with override_settings(SANDBOX=True):
             record=svc.submit(self.attempt().pk,self.payload());path=record.signature.name;storage=record.signature.storage
-            old=svc.qr_token()
+            old=self.attempt()
             with self.captureOnCommitCallbacks(execute=True):svc.reset_sandbox(self.admin)
             self.assertEqual(Course.objects.count(),3);self.assertEqual(Enrollment.objects.count(),210)
             self.assertFalse(Attendance.objects.exists());self.assertFalse(Attempt.objects.exists())
             self.assertFalse(storage.exists(path));self.assertTrue(get_user_model().objects.filter(pk=self.admin.pk).exists())
-            with self.assertRaises(svc.Rejected):svc.exchange_qr(old)
+            self.assertFalse(Attempt.objects.filter(pk=old.pk).exists())
+            self.assertEqual(svc.exchange_qr().generation,Policy.current().generation)
 
     def test_mock_location_is_explicit_in_record(self):
         with override_settings(SANDBOX=True):
             self.p.location_mode='inside';self.p.save()
-            payload=self.payload();payload.pop('latitude')
+            payload=self.payload()
             record=svc.submit(self.attempt().pk,payload)
-            self.assertEqual(record.location_source,'mock-inside');self.assertIsNone(record.latitude)
+            self.assertEqual(record.location_source,'mock-inside');self.assertEqual(record.latitude,35.1)
 
     def test_student_cannot_read_private_pages_or_signature(self):
         record=svc.submit(self.attempt().pk,self.payload())
@@ -420,3 +426,155 @@ class AttendanceTests(TestCase):
     def test_anonymous_status_never_returns_roster(self):
         response=self.client.get(reverse('attempt_status'))
         self.assertNotIn('name',response.json());self.assertNotIn('student_id',response.json())
+
+    def guest_payload(self):
+        return {**self.payload(),'kind':'guest','department':'다른학과','student_id':'000987','name':'방문학생'}
+
+    def test_guest_daily_limit_and_next_day_without_roster(self):
+        self.enter_browser(self.client)
+        payload=self.guest_payload()
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
+        record=Attendance.objects.get(enrollment__isnull=True)
+        self.assertEqual(record.guest_date,timezone.localtime(svc.now()).date())
+        self.assertEqual(record.student_id,'000987');self.assertEqual(record.status,'present')
+        self.assertEqual(Enrollment.objects.count(),1)
+        self.assertContains(self.client.get(reverse('complete')),'다른학과')
+        self.assertNotContains(self.client.get(reverse('complete')),'<dt>수업</dt>')
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,200) # same-attempt retry
+        self.enter_browser(self.client)
+        self.assertIn('하루에 한 번',self.browser_submit(self.client,payload).json()['error'])
+        with patch('attendance.services.now',return_value=self.at+timedelta(days=1)):
+            self.enter_browser(self.client)
+            self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
+        self.assertEqual(Attendance.objects.filter(enrollment__isnull=True).count(),2)
+
+    def test_guest_validations_and_browser_binding_shared_with_courses(self):
+        self.enter_browser(self.client)
+        payload=self.guest_payload()
+        for invalid in [{'department':''},{'name':''},{'student_id':'x'*41},{'signature':''},{'latitude':None},{'kind':'unknown'}]:
+            self.assertEqual(self.browser_submit(self.client,{**payload,**invalid}).status_code,400)
+        payload.update(student_id=self.e.student_id,name=self.e.name)
+        self.assertEqual(self.browser_submit(self.client,payload).status_code,200)
+        self.enter_browser(self.client)
+        self.assertEqual(self.browser_submit(self.client,{**payload,'student_id':'other'}).status_code,400)
+        self.assertEqual(self.browser_submit(self.client).status_code,200)
+        self.assertEqual(Attendance.objects.count(),2)
+
+    def test_location_required_even_in_all_sandbox_modes(self):
+        with override_settings(SANDBOX=True):
+            for mode in ['real','inside','outside','inaccurate','unavailable']:
+                self.p.location_mode=mode;self.p.save()
+                for kind in ['course','guest']:
+                    payload=self.guest_payload() if kind=='guest' else self.payload()
+                    payload.pop('latitude')
+                    with self.assertRaisesMessage(svc.Rejected,'위치 정보가 없습니다'):
+                        svc.submit(self.attempt().pk,payload)
+            self.assertFalse(Attendance.objects.exists())
+
+    def test_only_current_courses_visible_and_status_updates_at_boundary(self):
+        self.enter_browser(self.client)
+        Course.objects.create(title='미래수업',starts_at=self.at+timedelta(minutes=11),ends_at=self.at+timedelta(hours=2))
+        Course.objects.create(title='종료수업',starts_at=self.at-timedelta(hours=1),ends_at=self.at)
+        Course.objects.create(title='중지수업',starts_at=self.at,ends_at=self.at+timedelta(hours=1),active=False)
+        with patch('attendance.services.now',return_value=self.at):
+            response=self.client.get(reverse('checkin'))
+            for title in ['미래수업','종료수업','중지수업']:self.assertNotContains(response,title)
+            self.assertEqual([c['id'] for c in self.client.get(reverse('attempt_status')).json()['courses']],[self.c.pk])
+        with patch('attendance.services.now',return_value=self.at+timedelta(hours=2)):
+            data=self.client.get(reverse('attempt_status')).json()
+            self.assertEqual(data['courses'],[])
+            self.assertNotIn(str(self.e.student_id),json.dumps(data))
+
+    def test_server_clock_distinguishes_actual_and_test_time(self):
+        with override_settings(SANDBOX=True):
+            svc.set_test_time(self.p,self.at-timedelta(days=3))
+            data=self.client.get(reverse('clock')).json()
+            from datetime import datetime
+            self.assertLess(abs((datetime.fromisoformat(data['server_time'])-timezone.now()).total_seconds()),3)
+            self.assertGreater((datetime.fromisoformat(data['server_time'])-datetime.fromisoformat(data['attendance_time'])).total_seconds(),2*86400)
+            self.assertContains(self.client.get(reverse('home')),'서버 시각')
+
+    def test_guest_staff_permissions_exports_and_manual_edit(self):
+        record=svc.submit(self.attempt().pk,self.guest_payload())
+        for route in ['guests','guest_export','guest_new']:
+            self.assertEqual(self.client.get(reverse(route)).status_code,302)
+        self.assertEqual(self.client.get(reverse('guest_record',args=[record.pk])).status_code,302)
+        self.client.force_login(self.staff)
+        self.assertContains(self.client.get(reverse('guests')),'방문학생')
+        self.assertContains(self.client.get(reverse('browser_diagnostics')),'000987')
+        import openpyxl
+        for signatures in ['0','1']:
+            r=self.client.get(reverse('guest_export'),{'signatures':signatures})
+            sheet=openpyxl.load_workbook(io.BytesIO(b''.join(r.streaming_content))).active
+            self.assertEqual(sheet['C2'].value,'000987');self.assertEqual(len(sheet._images),int(signatures))
+            self.assertNotIn('수업명',[c.value for c in sheet[1]])
+        r=self.client.get(reverse('export'))
+        sheet=openpyxl.load_workbook(io.BytesIO(b''.join(r.streaming_content))).active
+        self.assertEqual(sheet.max_row,2);self.assertEqual(sheet['E2'].value,self.e.student_id)
+        url=reverse('guest_record',args=[record.pk]);page=self.client.get(url)
+        data={**page.context['form'].initial,'name':'수정이름','reason':'현장에서 본인 확인'}
+        self.assertEqual(self.client.post(url,data).status_code,302)
+        record.refresh_from_db();self.assertEqual(record.name,'수정이름');self.assertEqual(record.signed_name,'방문학생')
+        self.assertTrue(record.signature);self.assertEqual(record.method,'manual')
+        self.assertContains(self.client.post(url,data),'기록이 변경')
+        self.assertTrue(Audit.objects.filter(action='타 학과 출석 정정').exists())
+
+    def test_guest_reset_removes_signature_and_courses_delete_preserves_guest(self):
+        guest=svc.submit(self.attempt().pk,self.guest_payload());path=guest.signature.name;storage=guest.signature.storage
+        self.client.force_login(self.staff)
+        url=reverse('course_delete',args=[self.c.pk]);token=self.client.get(url).context['token']
+        self.client.post(url,{'token':token,'confirm':self.c.title,'reason':'잘못 등록한 수업'})
+        self.assertTrue(Attendance.objects.filter(pk=guest.pk).exists())
+        with override_settings(SANDBOX=True),self.captureOnCommitCallbacks(execute=True):
+            svc.reset_sandbox(self.staff)
+        self.assertFalse(Attendance.objects.exists());self.assertFalse(storage.exists(path))
+
+    def test_guest_duplicate_other_browser_and_korean_midnight(self):
+        from datetime import datetime, timezone as dt_timezone
+        payload=self.guest_payload()
+        with patch('attendance.services.now',return_value=datetime(2026,10,25,14,59,59,tzinfo=dt_timezone.utc)):
+            first=svc.submit(self.attempt().pk,payload)
+            self.assertEqual(first.guest_date.isoformat(),'2026-10-25')
+            with self.assertRaisesMessage(svc.Rejected,'하루에 한 번'):
+                svc.submit(self.attempt().pk,payload)
+        with patch('attendance.services.now',return_value=datetime(2026,10,25,15,0,0,tzinfo=dt_timezone.utc)):
+            second=svc.submit(self.attempt().pk,payload)
+            self.assertEqual(second.guest_date.isoformat(),'2026-10-26')
+
+    def test_guest_manual_duplicate_and_database_constraint(self):
+        record=svc.submit(self.attempt().pk,self.guest_payload())
+        self.client.force_login(self.staff)
+        data={'department':record.department,'student_id':record.student_id,'name':record.name,
+            'guest_date':record.guest_date,'attended_at':record.attended_at,'status':'present','reason':'현장 확인 처리','revision':'new'}
+        self.assertContains(self.client.post(reverse('guest_new'),data),'출석이 이미 있습니다')
+        data['student_id']='new-student'
+        self.assertEqual(self.client.post(reverse('guest_new'),data).status_code,302)
+        self.assertEqual(Attendance.objects.filter(enrollment__isnull=True).count(),2)
+        from django.db import IntegrityError,transaction
+        with self.assertRaises(IntegrityError),transaction.atomic():
+            Attendance.objects.create(guest_date=record.guest_date,student_id=record.student_id,department=record.department,name=record.name,status='present')
+
+
+from django.test import TransactionTestCase
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+
+class MigrationPreservationTests(TransactionTestCase):
+    def test_existing_roster_and_signed_attendance_survive_upgrade(self):
+        previous=[('attendance','0002_browseridentity_attempt_browser_revision_and_more')]
+        latest=[('attendance','0003_remove_policy_qr_seconds_attendance_department_and_more')]
+        executor=MigrationExecutor(connection)
+        executor.migrate(previous)
+        try:
+            apps=executor.loader.project_state(previous).apps
+            at=timezone.now()
+            course=apps.get_model('attendance','Course').objects.create(title='기존 수업',starts_at=at,ends_at=at+timedelta(hours=1))
+            row=apps.get_model('attendance','Enrollment').objects.create(course=course,student_id='001',name='기존 학생')
+            saved=apps.get_model('attendance','Attendance').objects.create(enrollment=row,status='present',attended_at=at,signature='signatures/existing.png',signed_name='기존 학생')
+            MigrationExecutor(connection).migrate(latest)
+            record=Attendance.objects.get(pk=saved.pk)
+            self.assertEqual(record.enrollment.student_id,'001')
+            self.assertEqual(record.signature.name,'signatures/existing.png')
+            self.assertEqual(record.signed_name,'기존 학생');self.assertIsNone(record.guest_date)
+        finally:
+            MigrationExecutor(connection).migrate(latest)

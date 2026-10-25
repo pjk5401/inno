@@ -30,7 +30,7 @@ def now(policy=None):
 
 def snapshot(p):
     return {k: getattr(p, k) for k in ['latitude','longitude','radius','max_accuracy',
-        'before_minutes','late_minutes','qr_seconds','writing_seconds','generation']}
+        'before_minutes','late_minutes','writing_seconds','generation']}
 
 def audit(user, action, target='', **details):
     Audit.objects.create(actor=user if user and user.is_authenticated else None,
@@ -50,26 +50,10 @@ def throttle(key, limit, seconds=60):
     if not allowed:
         raise Rejected('요청이 너무 많습니다. 잠시 후 다시 시도해주세요.')
 
-def qr_token(p=None, expired=False):
-    p = p or Policy.current()
-    stamp = int(now(p).timestamp())
-    slot = stamp // p.qr_seconds * p.qr_seconds
-    if expired:
-        slot -= p.qr_seconds
-    return signing.dumps({'env': settings.SANDBOX, 'generation': p.generation,
-                          'start': slot, 'end': slot + p.qr_seconds}, salt='attendance-qr')
-
-def exchange_qr(token, browser_id=None):
+def exchange_qr(browser_id=None):
+    # The printed entry URL is permanent. Only the writing session expires.
     with transaction.atomic():
         p = Policy.objects.select_for_update().get(pk=Policy.current().pk)
-        try:
-            data = signing.loads(token, salt='attendance-qr')
-        except (signing.BadSignature, ValueError, TypeError):
-            raise Rejected('올바른 QR이 아닙니다. 현장의 최신 QR을 스캔해주세요.')
-        stamp = now(p).timestamp()
-        if (data.get('env') != settings.SANDBOX or data.get('generation') != p.generation
-            or not data.get('start', math.inf) <= stamp < data.get('end', -math.inf)):
-            raise Rejected('QR이 만료되었거나 테스트가 초기화되었습니다. 최신 QR을 스캔해주세요.')
         browser = BrowserIdentity.objects.filter(pk=browser_id).first() if browser_id else None
         if browser is None:
             browser = BrowserIdentity.objects.create()
@@ -79,9 +63,9 @@ def exchange_qr(token, browser_id=None):
 
 def valid_attempt(attempt, p):
     if not attempt or attempt.generation != p.generation:
-        raise Rejected('접속이 초기화되었습니다. 현장의 새 QR을 스캔해주세요.')
+        raise Rejected('접속이 초기화되었습니다. 현장의 고정 QR을 스캔해주세요.')
     if not attempt.browser_id or attempt.browser_revision != attempt.browser.revision:
-        raise Rejected('학번 정보가 변경되었습니다. 현장의 새 QR을 스캔해주세요.')
+        raise Rejected('학번 정보가 변경되었습니다. 현장의 고정 QR을 스캔해주세요.')
     if now(p) >= attempt.expires_at:
         raise Rejected('작성 시간이 만료되었습니다. 입력을 유지한 채 새 QR을 스캔해주세요.')
 
@@ -103,16 +87,6 @@ def distance_m(lat1, lon1, lat2, lon2):
     return 6371000 * 2 * math.asin(min(1, math.sqrt(h)))
 
 def location_check(p, payload):
-    if settings.SANDBOX and p.location_mode != 'real':
-        if p.location_mode == 'outside':
-            raise Rejected('[모의 위치] 인정 구역 밖입니다.')
-        if p.location_mode == 'inaccurate':
-            raise Rejected('[모의 위치] 위치 정확도가 부족합니다. 다시 측정하거나 조교에게 문의해주세요.')
-        if p.location_mode == 'unavailable':
-            raise Rejected('[모의 위치] 위치를 측정할 수 없습니다. 조교에게 문의해주세요.')
-        return {'latitude':None,'longitude':None,'accuracy':None,'location_source':'mock-inside'}
-    if p.latitude is None or p.longitude is None:
-        raise Rejected('출석 인정 구역이 설정되지 않았습니다. 조교에게 문의해주세요.')
     try:
         lat, lon, acc, stamp = [float(payload[k]) for k in ['latitude','longitude','accuracy','location_timestamp']]
         if not all(math.isfinite(v) for v in [lat,lon,acc,stamp]):
@@ -125,6 +99,13 @@ def location_check(p, payload):
     age = timezone.now().timestamp() - stamp/1000
     if age > 60 or age < -15:
         raise Rejected('위치 정보가 오래되었거나 휴대폰 시각이 맞지 않습니다. 다시 측정해주세요.')
+    if settings.SANDBOX and p.location_mode != 'real':
+        errors = {'outside':'인정 구역 밖입니다.', 'inaccurate':'위치 정확도가 부족합니다.', 'unavailable':'위치를 측정할 수 없습니다.'}
+        if p.location_mode in errors:
+            raise Rejected('[모의 판정] '+errors[p.location_mode])
+        return {'latitude':lat,'longitude':lon,'accuracy':acc,'location_source':'mock-inside'}
+    if p.latitude is None or p.longitude is None:
+        raise Rejected('출석 인정 구역이 설정되지 않았습니다. 조교에게 문의해주세요.')
     if acc > p.max_accuracy:
         raise Rejected(f'위치 오차가 큽니다(약 {round(acc)}m). 다시 측정하거나 조교에게 문의해주세요.')
     if distance_m(lat,lon,p.latitude,p.longitude) > p.radius:
@@ -160,10 +141,10 @@ def submit(attempt_id, payload):
             p = Policy.objects.select_for_update().get(pk=Policy.current().pk)
             attempt = Attempt.objects.select_for_update().filter(pk=attempt_id).first()
             if not attempt or not attempt.browser_id:
-                raise Rejected('현장의 새 QR을 스캔해주세요.')
+                raise Rejected('현장의 고정 QR을 스캔해주세요.')
             browser = BrowserIdentity.objects.select_for_update().get(pk=attempt.browser_id)
             if attempt.browser_revision != browser.revision:
-                raise Rejected('학번 정보가 변경되었습니다. 현장의 새 QR을 스캔해주세요.')
+                raise Rejected('학번 정보가 변경되었습니다. 현장의 고정 QR을 스캔해주세요.')
             sid = str(payload.get('student_id','')).strip()
             if browser.student_id and browser.student_id != sid:
                 raise Rejected('이 브라우저에 등록된 학번과 다릅니다. 현장에서 조교에게 수동 출석을 요청해주세요.')
@@ -171,24 +152,34 @@ def submit(attempt_id, payload):
                 return attempt.completed
             valid_attempt(attempt,p)
             at = now(p)
-            try:
-                course = Course.objects.get(pk=int(payload.get('course',0)))
-            except (Course.DoesNotExist,ValueError,TypeError):
-                raise Rejected('수업을 선택해주세요.')
-            state = course_status(course,p,at)
-            sid = str(payload.get('student_id','')).strip()
+            kind = payload.get('kind','course')
             name = str(payload.get('name','')).strip()
-            enrollment = Enrollment.objects.select_for_update().filter(course=course,student_id=sid,name=name).first()
-            if not enrollment:
-                raise Rejected('수업 명단과 학번·이름이 일치하지 않습니다. 입력을 확인하거나 조교에게 문의해주세요.')
             location = location_check(p,payload)
-            existing = Attendance.objects.filter(enrollment=enrollment).first()
-            if existing:
-                # Do not expose somebody else's record based only on a known name/ID.
-                raise Rejected('이미 처리된 출석입니다. 중복 제출은 반영하지 않습니다. 확인이 필요하면 조교에게 문의해주세요.')
+            if kind == 'guest':
+                department = str(payload.get('department','')).strip()
+                if not sid or len(sid)>40 or not name or len(name)>80 or not department or len(department)>100:
+                    raise Rejected('학과·학번·이름을 올바르게 입력해주세요.')
+                day = timezone.localtime(at).date()
+                if Attendance.objects.filter(enrollment__isnull=True,guest_date=day,student_id=sid).exists():
+                    raise Rejected('오늘 이미 처리된 타 학과 출석입니다. 하루에 한 번만 제출할 수 있습니다.')
+                record = Attendance(guest_date=day,department=department,student_id=sid,name=name,status='present',attended_at=at,
+                                    signed_name=name,policy_snapshot=snapshot(p),**location)
+            elif kind == 'course':
+                try:
+                    course = Course.objects.get(pk=int(payload.get('course',0)))
+                except (Course.DoesNotExist,ValueError,TypeError):
+                    raise Rejected('수업을 선택해주세요.')
+                state = course_status(course,p,at)
+                enrollment = Enrollment.objects.select_for_update().filter(course=course,student_id=sid,name=name).first()
+                if not enrollment:
+                    raise Rejected('수업 명단과 학번·이름이 일치하지 않습니다. 입력을 확인하거나 조교에게 문의해주세요.')
+                if Attendance.objects.filter(enrollment=enrollment).exists():
+                    raise Rejected('이미 처리된 출석입니다. 중복 제출은 반영하지 않습니다. 확인이 필요하면 조교에게 문의해주세요.')
+                record = Attendance(enrollment=enrollment,status=state,attended_at=at,
+                                    signed_name=name,policy_snapshot=snapshot(p),**location)
+            else:
+                raise Rejected('출석 유형을 확인해주세요.')
             image = signature_image(payload.get('signature'))
-            record = Attendance(enrollment=enrollment,status=state,attended_at=at,
-                                signed_name=name,policy_snapshot=snapshot(p),**location)
             record.signature.save(f'{uuid.uuid4().hex}.png',ContentFile(image),save=False)
             saved_file = record.signature
             record.save()
@@ -278,8 +269,8 @@ def reset_sandbox(user=None):
         Course.objects.all().delete()
         Audit.objects.all().delete()
         p.generation += 1
-        p.before_minutes,p.late_minutes,p.qr_seconds,p.writing_seconds = 10,15,60,300
-        p.location_mode = 'inside'
+        p.before_minutes,p.late_minutes,p.writing_seconds = 10,15,300
+        p.location_mode = 'real'
         base = timezone.localtime().replace(hour=10,minute=0,second=0,microsecond=0)
         set_test_time(p,base)
         for i in range(1,4):

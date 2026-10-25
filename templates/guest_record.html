@@ -1,0 +1,5 @@
+{% extends 'base.html' %}{% block content %}
+<div class="page-head row-between"><h1>타 학과 {% if record %}출석 정정{% else %}수동 출석{% endif %}</h1><a href="{% url 'guests' %}">목록</a></div>
+<div class="two-col"><form class="card stack" method="post">{% csrf_token %}{{ form.as_p }}<button>사유와 함께 저장</button></form><section class="card"><h2>학생 제출 기록</h2>{% if record %}<p>서명 시 이름: {{ record.signed_name|default:'—' }}</p><p>위치: {{ record.latitude|floatformat:1|default:'—' }}, {{ record.longitude|floatformat:1|default:'—' }} · {{ record.location_source|default:'없음' }}</p>{% if record.signature %}<img class="signature-preview" src="{% url 'signature' record.pk %}" alt="제출한 서명">{% else %}<p>서명 없음</p>{% endif %}<p class="small muted">정정해도 원래 제출한 서명은 보존합니다.</p><a href="{% url 'browser_diagnostics' %}?q={{ record.student_id|urlencode }}">브라우저 출석 진단</a>{% else %}<p>현장에서 확인한 출석만 사유와 함께 입력해주세요.</p>{% endif %}</section></div>
+<section class="card"><h2>변경 이력</h2>{% for h in history %}<p>{{ h.created_at|date:'Y.m.d H:i:s' }} · {{ h.actor }}</p><pre>{{ h.details }}</pre>{% empty %}<p>변경 이력이 없습니다.</p>{% endfor %}</section>
+{% endblock %}

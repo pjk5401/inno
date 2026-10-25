@@ -1,3 +1,6 @@
-(() => {const root=document.getElementById('qr-screen'),img=document.getElementById('qr-image'),err=document.getElementById('qr-error'),link=document.getElementById('qr-link');let seconds=0,last=Date.now(),running=false;
-async function refresh(){if(running)return;running=true;try{const response=await fetch(root.dataset.url,{cache:'no-store'});if(!response.ok||!response.headers.get('content-type')?.includes('application/json'))throw new Error();const d=await response.json();img.src=d.image;img.hidden=false;err.hidden=true;seconds=d.remaining;last=Date.now();link.href=d.url;link.hidden=false;document.getElementById('qr-clock').textContent=d.clock;document.getElementById('qr-mode').textContent=d.mode;}catch{img.hidden=true;link.hidden=true;err.textContent='QR을 갱신하지 못했습니다. 연결과 담당자 로그인 상태를 확인해주세요.';err.hidden=false;seconds=3;last=Date.now();}finally{running=false;}}
-setInterval(()=>{seconds=Math.max(0,seconds-(Date.now()-last)/1000);last=Date.now();document.getElementById('qr-timer').textContent=Math.ceil(seconds);if(seconds===0)refresh();},250);document.getElementById('fullscreen').onclick=()=>root.requestFullscreen?.();refresh();})();
+(() => {
+  const root=document.getElementById('qr-screen'),img=document.getElementById('qr-image'),err=document.getElementById('qr-error'),link=document.getElementById('qr-link'),print=document.getElementById('print-qr');
+  print.onclick=()=>window.print();
+  async function load(){try{const response=await fetch(root.dataset.url,{cache:'no-store'});if(!response.ok)throw new Error();const d=await response.json();img.src=d.image;await img.decode();img.hidden=false;err.hidden=true;link.href=d.url;link.hidden=false;print.disabled=false;}catch{err.textContent='QR을 불러오지 못했습니다. 로그인과 연결 상태를 확인하고 새로고침해주세요.';}}
+  load();
+})();
