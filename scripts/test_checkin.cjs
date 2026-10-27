@@ -4,13 +4,13 @@ const {runInNewContext}=require('node:vm');
 const assert=require('node:assert/strict');
 const source=readFileSync(require('node:path').join(__dirname,'../static/checkin.js'),'utf8');
 
-function screen(mock='0') {
+function screen(mock='0',guestEnabled='1',draft=null) {
   const elements=new Map();
   function el(id){if(!elements.has(id))elements.set(id,{hidden:false,disabled:false,textContent:'',value:'',addEventListener(){}});return elements.get(id);}
   const form=el('checkin-form');
   const handlers={},timers=[];
   let elapsed=0;
-  form.dataset={remaining:'300',generation:'1',storage:'test',identity:'test-id',boundId:'',mock,submit:'/submit',status:'/status'};
+  form.dataset={guestEnabled,remaining:'300',generation:'1',storage:'test',identity:'test-id',boundId:'',mock,submit:'/submit',status:'/status'};
   form.querySelector=()=>({value:'csrf'});
   form.elements={kind:{value:'course'},name:{value:'테스트학생'}};
   form.course={value:'1',options:[{},{}]};form.student_id={value:'001'};form.department={value:'테스트학과'};
@@ -22,7 +22,7 @@ function screen(mock='0') {
     document:{getElementById:el,addEventListener(){}},
     window:{devicePixelRatio:1,addEventListener(){},location:{assign(url){context.redirect=url;}}},
     performance:{now:()=>elapsed},Date,Promise,JSON,Number,Math,String,
-    sessionStorage:{getItem:()=>null,setItem(){},removeItem(){}},setInterval(fn){timers.push(fn);},
+    sessionStorage:{getItem:()=>draft?JSON.stringify(draft):null,setItem(){},removeItem(){}},setInterval(fn){timers.push(fn);},
     SignaturePad:class {toData(){return [];}fromData(){}clear(){}addEventListener(){}isEmpty(){return false;}toDataURL(){return 'test-signature';}},
     navigator:{geolocation:{getCurrentPosition(ok,fail){geo.calls++;if(geo.denied)fail({code:1});else ok({coords:{latitude:35.123456,longitude:129.123456,accuracy:10},timestamp:Date.now()});}}},
     fetch:async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});return {ok:true,json:async()=>({ok:true,redirect:'/complete'})};},
@@ -63,5 +63,13 @@ function screen(mock='0') {
     assert.equal(s.geo.calls,3);
     assert.equal(s.requests.length,1);
   }
+  const hidden=screen('0','0',{identity:'test-id',generation:'1',kind:'guest',department:'이전학과',student_id:'001',name:'학생',course:'1',saved:Date.now()});
+  assert.equal(hidden.form.elements.kind.value,'course');
+  hidden.form.elements.kind.value='guest';hidden.handlers.change();
+  assert.equal(hidden.el('course-field').hidden,false);
+  assert.equal(hidden.form.course.required,true);
+  assert.equal(hidden.form.department.required,false);
+  await hidden.handlers.submit({preventDefault(){}});
+  assert.equal(hidden.requests[0].body.kind,'course');
   console.log('PASS: location requested only on submit, denial/retry/revocation, full precision, sandbox parity, hidden expiry');
 })().catch(e=>{console.error(e);process.exitCode=1;});

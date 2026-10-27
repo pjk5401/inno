@@ -5,14 +5,14 @@
   const csrf=form.querySelector('[name=csrfmiddlewaretoken]').value;
   const error=document.getElementById('form-error'),button=document.getElementById('submit-button');
   let remaining=Number(form.dataset.remaining),lastTick=performance.now(),busy=false,valid=true;
-  const kind=()=>form.elements.kind.value;
+  const kind=()=>form.dataset.guestEnabled==='1'?form.elements.kind.value:'course';
   function notice(msg){error.textContent=msg;error.hidden=false;}
   function controls(){button.disabled=busy||!valid||remaining<=0||(kind()==='course'&&form.course.options.length<=1);}
   function mode(){const guest=kind()==='guest';document.getElementById('course-field').hidden=guest;form.course.required=!guest;form.course.disabled=guest;document.getElementById('department-field').hidden=!guest;form.department.disabled=!guest;form.department.required=guest;controls();}
   function save(){try{sessionStorage.setItem(key,JSON.stringify({identity:form.dataset.identity,generation:form.dataset.generation,kind:kind(),department:form.department.value,course:form.course.value,student_id:form.student_id.value,name:form.elements.name.value,signature:pad.toData(),saved:Date.now()}));}catch{}}
   function resize(){const data=pad.toData(),ratio=Math.max(window.devicePixelRatio||1,1);canvas.width=canvas.offsetWidth*ratio;canvas.height=canvas.offsetHeight*ratio;canvas.getContext('2d').scale(ratio,ratio);pad.clear();pad.fromData(data);}
   resize();window.addEventListener('resize',resize);
-  try{const old=JSON.parse(sessionStorage.getItem(key)||'null');if(old&&old.identity===form.dataset.identity&&String(old.generation)===form.dataset.generation&&Date.now()-old.saved<3600000){form.elements.kind.value=old.kind==='guest'?'guest':'course';form.department.value=old.department||'';form.course.value=old.course;form.student_id.value=old.student_id;form.elements.name.value=old.name;if(old.signature)pad.fromData(old.signature);}else sessionStorage.removeItem(key);}catch{}
+  try{const old=JSON.parse(sessionStorage.getItem(key)||'null');if(old&&old.identity===form.dataset.identity&&String(old.generation)===form.dataset.generation&&Date.now()-old.saved<3600000){form.elements.kind.value=form.dataset.guestEnabled==='1'&&old.kind==='guest'?'guest':'course';form.department.value=old.department||'';form.course.value=old.course;form.student_id.value=old.student_id;form.elements.name.value=old.name;if(old.signature)pad.fromData(old.signature);}else sessionStorage.removeItem(key);}catch{}
   if(form.dataset.boundId){form.student_id.value=form.dataset.boundId;form.student_id.readOnly=true;}
   mode();form.addEventListener('change',mode);form.addEventListener('input',save);pad.addEventListener('endStroke',save);
   document.getElementById('clear-signature').onclick=()=>{pad.clear();save();};

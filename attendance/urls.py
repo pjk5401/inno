@@ -18,6 +18,7 @@ urlpatterns=[
     path('staff/courses/<int:pk>/import/',v.roster_import,name='import'),
     path('staff/courses/<int:course_id>/students/new/',v.enrollment_edit,name='enrollment_new'),
     path('staff/courses/<int:course_id>/students/<int:pk>/',v.enrollment_edit,name='enrollment_edit'),
+    path('staff/courses/<int:course_id>/students/<int:pk>/delete/',v.enrollment_delete,name='enrollment_delete'),
     path('staff/records/<int:pk>/',v.record_detail,name='record'),path('staff/signatures/<int:pk>/',v.signature,name='signature'),
     path('staff/export/',v.export,name='export'),path('staff/location/',v.location,name='location'),
     path('staff/qr/',v.qr_display,name='qr'),path('staff/qr/data/',v.qr_data,name='qr_data'),

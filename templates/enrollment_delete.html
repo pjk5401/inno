@@ -1,0 +1,8 @@
+{% extends 'base.html' %}{% block width %}narrow{% endblock %}{% block content %}
+<div class="page-head"><h1>학생 명단 삭제</h1><p>{{ row.course }}</p></div>
+<section class="card danger-zone stack">
+<dl><dt>학과</dt><dd>{{ row.department|default:'—' }}</dd><dt>학생</dt><dd>{{ row.student_id }} · {{ row.name }}</dd><dt>연결된 출석</dt><dd>{{ preview.records }}건</dd><dt>서명</dt><dd>{{ preview.signatures }}개</dd></dl>
+<p>이 수업의 학생 명단과 연결된 출석·서명을 삭제합니다. 다른 수업의 동일 학생 기록과 브라우저 학번 등록, 변경 이력은 유지됩니다. 웹에서 되돌릴 수 없으며 기존 백업은 자동 변경하지 않습니다.</p>
+<div class="toolbar"><a href="{% url 'export' %}?course={{ row.course_id }}">간단 엑셀</a><a href="{% url 'export' %}?course={{ row.course_id }}&amp;signatures=1">서명 엑셀</a></div>
+<form class="stack" method="post">{% csrf_token %}<input type="hidden" name="token" value="{{ token }}"><label>삭제할 학번 확인<input name="confirm" autocomplete="off" maxlength="40" required placeholder="{{ row.student_id }}"></label><label>삭제 사유<textarea name="reason" rows="3" maxlength="1000" required></textarea></label><div class="toolbar"><button class="danger">학생 명단 삭제</button><a class="button secondary" href="{% url 'course' row.course_id %}">취소</a></div></form>
+</section>{% endblock %}

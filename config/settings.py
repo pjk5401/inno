@@ -3,6 +3,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SANDBOX = os.getenv('APP_ENV', 'live') == 'sandbox'
+# Keep guest attendance data/routes available, but hide its entry points by default.
+GUEST_ATTENDANCE_VISIBLE = False
 APP_LABEL = '테스트 환경' if SANDBOX else '출석 서비스'
 URL_PREFIX = '/test' if SANDBOX else ''
 DEBUG = os.getenv('DEBUG', '0') == '1'

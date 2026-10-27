@@ -261,6 +261,24 @@ def enrollment_edit(request,course_id,pk=None):
             return redirect('course',pk=c.pk)
     return render(request,'form.html',{'form':form,'title':'학생 명단 수정' if pk else '학생 추가','note':'학생 계정은 생성하지 않습니다. 기존 서명 당시 이름은 출석 상세에 별도로 보존됩니다.'})
 
+@staff_required
+def enrollment_delete(request,course_id,pk):
+    row = get_object_or_404(Enrollment.objects.select_related('course'),pk=pk,course_id=course_id)
+    if request.method == 'POST':
+        try:
+            svc.delete_enrollment(course_id,pk,request.POST.get('token',''),request.POST.get('confirm',''),request.POST.get('reason',''),request.user)
+            messages.success(request,'해당 수업의 학생 명단과 연결된 출석·서명을 삭제했습니다.')
+            return redirect('course',pk=course_id)
+        except svc.Rejected as e:
+            messages.error(request,str(e))
+            row = Enrollment.objects.select_related('course').filter(pk=pk,course_id=course_id).first()
+            if row is None:
+                return redirect('courses')
+    preview = svc.enrollment_delete_preview(row)
+    return render(request,'enrollment_delete.html',{'row':row,'preview':preview,
+        'token':signing.dumps(preview,salt='enrollment-delete')})
+
+
 def read_xlsx(upload):
     if not upload or not upload.name.lower().endswith('.xlsx') or upload.size>5*1024*1024:
         raise svc.Rejected('5MB 이하의 .xlsx 파일을 선택해주세요.')

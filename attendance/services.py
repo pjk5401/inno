@@ -248,6 +248,53 @@ def delete_course(course_id, token, confirmation, reason, user):
                     logging.getLogger(__name__).exception('Deleted course signature cleanup failed: %s',path)
         transaction.on_commit(cleanup)
 
+def enrollment_delete_preview(row):
+    record = Attendance.objects.filter(enrollment=row).values().first()
+    state = {'enrollment':Enrollment.objects.filter(pk=row.pk).values().get(),
+             'course':Course.objects.filter(pk=row.course_id).values().get(), 'record':record}
+    return {'enrollment_id':row.pk,'course_id':row.course_id,
+        'fingerprint':hashlib.sha256(json.dumps(state,sort_keys=True,default=str).encode()).hexdigest(),
+        'records':int(record is not None),'signatures':int(bool(record and record['signature']))}
+
+
+def delete_enrollment(course_id, enrollment_id, token, confirmation, reason, user):
+    try:
+        expected = signing.loads(token,salt='enrollment-delete',max_age=1800)
+    except (signing.BadSignature,ValueError,TypeError):
+        raise Rejected('삭제 확인 화면을 다시 열어주세요.')
+    if not reason.strip() or len(reason)>1000:
+        raise Rejected('삭제 사유를 1,000자 이내로 입력해주세요.')
+    with transaction.atomic():
+        Policy.objects.select_for_update().get(pk=Policy.current().pk)
+        if not Course.objects.select_for_update().filter(pk=course_id).first():
+            raise Rejected('이미 삭제된 수업입니다.')
+        row = Enrollment.objects.select_for_update().filter(pk=enrollment_id,course_id=course_id).first()
+        if not row:
+            raise Rejected('이미 삭제된 학생 명단입니다.')
+        actual = enrollment_delete_preview(row)
+        if actual != expected:
+            raise Rejected('학생 정보나 출석 기록이 변경되었습니다. 삭제 범위를 다시 확인해주세요.')
+        if confirmation != row.student_id:
+            raise Rejected('학번을 정확히 입력해주세요.')
+        records = Attendance.objects.filter(enrollment=row)
+        paths = list(records.exclude(signature='').values_list('signature',flat=True))
+        storage = Attendance._meta.get_field('signature').storage
+        Attempt.objects.filter(completed__in=records).delete()
+        records.delete()
+        details = {'course_id':course_id,'course':str(row.course),'student_id':row.student_id,
+            'name':row.name,'department':row.department,'records':actual['records'],
+            'signatures':actual['signatures'],'reason':reason.strip()}
+        row.delete()
+        audit(user,'학생 명단 삭제',enrollment_id,**details)
+        def cleanup():
+            for path in paths:
+                try:
+                    storage.delete(path)
+                except OSError:
+                    logging.getLogger(__name__).exception('Deleted enrollment signature cleanup failed: %s',path)
+        transaction.on_commit(cleanup)
+
+
 def set_test_time(p, value):
     if not settings.SANDBOX:
         raise Rejected('운영 환경에서는 테스트 시간을 설정할 수 없습니다.')

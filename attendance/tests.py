@@ -352,8 +352,8 @@ class AttendanceTests(TestCase):
     def test_checkin_and_completed_flow(self):
         self.attach_attempt(self.attempt())
         response=self.client.get(reverse('checkin'));self.assertEqual(response.status_code,200)
-        self.assertContains(response,'<legend>소속</legend>')
-        self.assertContains(response,'소프트웨어대학');self.assertContains(response,'그 외')
+        self.assertNotContains(response,'<legend>소속</legend>')
+        self.assertNotContains(response,'value="guest"');self.assertNotContains(response,'개인정보 처리 안내')
         for removed in ['담당자 로그인','남은 시간','id="check-location"','id="location-status"']:
             self.assertNotContains(response,removed)
         response=self.client.post(reverse('submit'),data=json.dumps(self.payload()),content_type='application/json')
@@ -561,6 +561,90 @@ class AttendanceTests(TestCase):
         from django.db import IntegrityError,transaction
         with self.assertRaises(IntegrityError),transaction.atomic():
             Attendance.objects.create(guest_date=record.guest_date,student_id=record.student_id,department=record.department,name=record.name,status='present')
+
+    def test_guest_entry_points_hidden_but_data_and_routes_retained(self):
+        record=svc.submit(self.attempt().pk,self.guest_payload())
+        self.enter_browser(self.client)
+        self.assertNotContains(self.client.get(reverse('checkin')),'<legend>소속</legend>')
+        self.client.force_login(self.admin)
+        self.assertNotContains(self.client.get(reverse('dashboard')),reverse('guests'))
+        self.assertContains(self.client.get(reverse('guests')),record.student_id)
+        if settings.SANDBOX:
+            self.assertNotContains(self.client.get(reverse('sandbox')),'타 학과 출석 테스트')
+        with override_settings(GUEST_ATTENDANCE_VISIBLE=True):
+            self.assertContains(self.client.get(reverse('checkin')),'<legend>소속</legend>')
+            self.assertContains(self.client.get(reverse('dashboard')),reverse('guests'))
+        self.assertTrue(Attendance.objects.filter(pk=record.pk).exists())
+
+    def test_enrollment_delete_only_target_and_files_after_commit(self):
+        first=self.enter_browser(self.client);record=svc.submit(first.pk,self.payload())
+        path=record.signature.name;storage=record.signature.storage
+        other=Course.objects.create(title='다른 수업',starts_at=self.c.starts_at,ends_at=self.c.ends_at)
+        row=Enrollment.objects.create(course=other,student_id=self.e.student_id,name=self.e.name)
+        other_record=svc.submit(self.attempt().pk,{**self.payload(),'course':other.pk})
+        neighbor=Enrollment.objects.create(course=self.c,student_id='another',name='다른 학생')
+        guest=svc.submit(self.attempt().pk,self.guest_payload())
+        self.client.force_login(self.staff)
+        url=reverse('enrollment_delete',args=[self.c.pk,self.e.pk])
+        page=self.client.get(url)
+        self.assertEqual(page.context['preview']['signatures'],1)
+        self.assertTrue(Enrollment.objects.filter(pk=self.e.pk).exists())
+        with self.captureOnCommitCallbacks(execute=True):
+            response=self.client.post(url,{'token':page.context['token'],'confirm':self.e.student_id,'reason':'잘못 등록한 학생'})
+            self.assertRedirects(response,reverse('course',args=[self.c.pk]))
+            self.assertTrue(storage.exists(path))
+        self.assertFalse(storage.exists(path))
+        self.assertFalse(Enrollment.objects.filter(pk=self.e.pk).exists())
+        self.assertFalse(Attendance.objects.filter(pk=record.pk).exists())
+        self.assertFalse(Attempt.objects.filter(pk=first.pk).exists())
+        self.assertTrue(BrowserIdentity.objects.filter(pk=first.browser_id,student_id=self.e.student_id).exists())
+        self.assertTrue(Course.objects.filter(pk=self.c.pk).exists())
+        self.assertTrue(Enrollment.objects.filter(pk=neighbor.pk).exists())
+        self.assertTrue(Attendance.objects.filter(pk=other_record.pk).exists())
+        self.assertTrue(other_record.signature.storage.exists(other_record.signature.name))
+        self.assertTrue(Attendance.objects.filter(pk=guest.pk).exists())
+        log=Audit.objects.get(action='학생 명단 삭제',target=str(self.e.pk))
+        self.assertEqual(log.actor,self.staff);self.assertEqual(log.details['records'],1)
+
+    def test_enrollment_delete_permissions_confirmation_and_stale_preview(self):
+        url=reverse('enrollment_delete',args=[self.c.pk,self.e.pk])
+        self.assertEqual(self.client.get(url).status_code,302)
+        self.assertEqual(self.client.post(url).status_code,302)
+        ordinary=get_user_model().objects.create_user('ordinary-delete')
+        self.client.force_login(ordinary)
+        self.assertEqual(self.client.post(url).status_code,403)
+        self.client.force_login(self.admin)
+        page=self.client.get(url)
+        data={'token':page.context['token'],'confirm':self.e.student_id,'reason':'등록 실수'}
+        strict=Client(enforce_csrf_checks=True);strict.force_login(self.staff)
+        self.assertEqual(strict.post(url,data).status_code,403)
+        for bad in [{'token':'bad'},{'confirm':'다른학번'},{'reason':''}]:
+            self.assertEqual(self.client.post(url,{**data,**bad}).status_code,200)
+            self.assertTrue(Enrollment.objects.filter(pk=self.e.pk).exists())
+        svc.submit(self.attempt().pk,self.payload())
+        self.assertContains(self.client.post(url,data),'삭제 범위를 다시 확인')
+        self.assertTrue(Attendance.objects.filter(enrollment=self.e).exists())
+        other=Course.objects.create(title='잘못된 경로',starts_at=self.c.starts_at,ends_at=self.c.ends_at)
+        self.assertEqual(self.client.post(reverse('enrollment_delete',args=[other.pk,self.e.pk]),data).status_code,404)
+
+    def test_enrollment_delete_rollback_and_without_attendance(self):
+        from django.core import signing
+        record=svc.submit(self.attempt().pk,self.payload())
+        token=signing.dumps(svc.enrollment_delete_preview(self.e),salt='enrollment-delete')
+        with patch('attendance.services.audit',side_effect=RuntimeError('audit unavailable')):
+            with self.assertRaises(RuntimeError):
+                svc.delete_enrollment(self.c.pk,self.e.pk,token,self.e.student_id,'등록 실수',self.admin)
+        self.assertTrue(Enrollment.objects.filter(pk=self.e.pk).exists())
+        self.assertTrue(Attendance.objects.filter(pk=record.pk).exists())
+        self.assertTrue(record.signature.storage.exists(record.signature.name))
+        row=Enrollment.objects.create(course=self.c,student_id='empty',name='미출석 학생')
+        self.client.force_login(self.admin)
+        url=reverse('enrollment_delete',args=[self.c.pk,row.pk])
+        page=self.client.get(url)
+        self.assertEqual(page.context['preview']['records'],0)
+        self.assertEqual(self.client.post(url,{'token':page.context['token'],'confirm':'empty','reason':'중복 등록'}).status_code,302)
+        self.assertFalse(Enrollment.objects.filter(pk=row.pk).exists())
+
 
 
 from django.test import TransactionTestCase
