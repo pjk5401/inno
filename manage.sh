@@ -19,6 +19,18 @@ dc() {
     "${SUDO[@]}" docker compose --project-directory "$ROOT" --env-file "$ENV_FILE" -f "$COMPOSE" --profile test "$@"
 }
 cfg() { "${SUDO[@]}" awk -F= -v key="$1" '$1==key {print substr($0,length(key)+2)}' "$ENV_FILE"; }
+http_port() { local port; port=$(cfg HTTP_PORT); printf '%s' "${port:-80}"; }
+read_network_config() {
+    local current_origin=${1:-} current_port=${2:-80}
+    say '외부 접속 주소 전체를 입력하세요. 예: https://attendance.example.edu 또는 https://attendance.example.edu:8443'
+    read -r -p "외부 HTTPS 주소${current_origin:+ [$current_origin]}: " origin
+    origin=${origin:-$current_origin}
+    say 'VM HTTP 포트는 프록시가 연결할 포트입니다. 외부 HTTPS 포트와 다를 수 있습니다.'
+    read -r -p "VM HTTP 포트 [$current_port]: " port
+    port=${port:-$current_port}
+    network_config=$(python3 "$ROOT/deploy/network_config.py" "$origin" "$port") || return 1
+    port=$(printf '%s\n' "$network_config" | awk -F= '$1=="HTTP_PORT" {print $2}')
+}
 space_check() {
     local available
     available=$(df -Pk "$DATA" | awk 'NR==2 {print $4}')
@@ -31,8 +43,8 @@ check_environment() {
     free -h
     df -h /
     if command -v docker >/dev/null; then "${SUDO[@]}" docker --version; "${SUDO[@]}" docker compose version || true; else say 'Docker 미설치'; fi
-    say '80포트 리스닝 상태'
-    "${SUDO[@]}" ss -ltnp '( sport = :80 )' || true
+    say '현재 리스닝 포트 (최초 설정에서 사용할 VM HTTP 포트를 선택하세요)'
+    "${SUDO[@]}" ss -ltnp || true
 }
 install_infra() {
     [[ -f /etc/os-release ]] || return 1
@@ -68,21 +80,18 @@ prepare_dirs() {
     "${SUDO[@]}" chmod 755 "$DATA/backups"
 }
 setup() {
-    if "${SUDO[@]}" test -f "$ENV_FILE"; then say '기존 설정을 보존합니다. 실행 또는 계정 메뉴를 이용하세요.'; return; fi
+    if "${SUDO[@]}" test -f "$ENV_FILE"; then say '기존 설정을 보존합니다. 주소·포트는 17번, 계정은 11번 메뉴에서 변경하세요.'; return; fi
     command -v openssl >/dev/null || { say '2. 필수 인프라 설치를 먼저 실행하세요.'; return 1; }
     "${SUDO[@]}" docker compose version >/dev/null
     prepare_dirs
-    local origin host trust temp
-    read -r -p '외부 HTTPS 주소 [https://inno-pjk5401.apps.dauai.org]: ' origin
-    origin=${origin:-https://inno-pjk5401.apps.dauai.org}; origin=${origin%/}
-    [[ $origin =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?$ ]] || { say '경로 없는 HTTPS 주소를 입력하세요.'; return 1; }
-    host=${origin#https://}; host=${host%%:*}
+    local origin port network_config trust temp
+    read_network_config
     say '학교 프록시가 X-Forwarded-Proto를 정제하고 VM 직접 접근이 제한된 것이 확인된 경우에만 1을 선택하세요.'
     read -r -p 'HTTPS 프록시 헤더 신뢰 [0]: ' trust
     trust=${trust:-0}; [[ $trust == 0 || $trust == 1 ]] || return 1
     temp=$(mktemp)
     {
-        printf 'PUBLIC_ORIGIN=%s\nALLOWED_HOSTS=%s,localhost,127.0.0.1\nTRUST_PROXY_HTTPS=%s\n' "$origin" "$host" "$trust"
+        printf '%s\nTRUST_PROXY_HTTPS=%s\n' "$network_config" "$trust"
         printf 'POSTGRES_PASSWORD=%s\nLIVE_DB_PASSWORD=%s\nTEST_DB_PASSWORD=%s\nLIVE_SECRET_KEY=%s\nTEST_SECRET_KEY=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" "$(openssl rand -hex 48)" "$(openssl rand -hex 48)"
     } > "$temp"
     "${SUDO[@]}" install -m 600 "$temp" "$ENV_FILE"
@@ -113,23 +122,48 @@ build_and_migrate() {
     dc run --rm --no-deps test python manage.py check
 }
 check_port() {
+    local port; port=$(http_port)
     if dc ps --status running --services | grep -qx nginx; then return; fi
-    if "${SUDO[@]}" ss -ltn '( sport = :80 )' | tail -n +2 | grep -q .; then
-        say '80포트를 다른 서비스가 사용하고 있습니다. 기존 프로젝트를 자동 중지하지 않습니다.';return 1
+    if "${SUDO[@]}" ss -ltn "( sport = :$port )" | tail -n +2 | grep -q .; then
+        say "${port}포트를 다른 서비스가 사용하고 있습니다. 기존 프로젝트를 자동 중지하지 않습니다.";return 1
     fi
 }
 start_live() {
     need_config;check_port;build_and_migrate
     dc up -d --wait --wait-timeout 120 db live nginx
-    curl --fail --silent --show-error -H "Host: $(cfg PUBLIC_ORIGIN | sed 's#https://##')" http://127.0.0.1/health/
+    curl --fail --silent --show-error -H "Host: $(cfg PUBLIC_ORIGIN | sed 's#https://##')" "http://127.0.0.1:$(http_port)/health/"
     say "운영 주소: $(cfg PUBLIC_ORIGIN)/staff/"
 }
 start_test() {
     need_config;check_port;build_and_migrate
     dc up -d --wait --wait-timeout 120 db live test nginx
-    curl --fail --silent --show-error -H "Host: $(cfg PUBLIC_ORIGIN | sed 's#https://##')" http://127.0.0.1/test/health/
+    curl --fail --silent --show-error -H "Host: $(cfg PUBLIC_ORIGIN | sed 's#https://##')" "http://127.0.0.1:$(http_port)/test/health/"
     say "테스트 제어: $(cfg PUBLIC_ORIGIN)/test/staff/test-control/"
 }
+change_network() (
+    set -Eeuo pipefail
+    need_config
+    local origin port network_config temp saved running old_port
+    old_port=$(http_port)
+    read_network_config "$(cfg PUBLIC_ORIGIN)" "$old_port"
+    if [[ $port != "$old_port" ]] && "${SUDO[@]}" ss -ltn "( sport = :$port )" | tail -n +2 | grep -q .; then
+        say "${port}포트를 다른 서비스가 사용하고 있습니다. 설정을 변경하지 않았습니다.";return 1
+    fi
+    running=$(dc ps --status running --services | grep -E '^(live|test|nginx)$' || true)
+    temp=$(mktemp)
+    trap 'rm -f -- "$temp"' EXIT
+    "${SUDO[@]}" python3 "$ROOT/deploy/network_config.py" "$origin" "$port" --env-file "$ENV_FILE" > "$temp"
+    "${SUDO[@]}" docker compose --project-directory "$ROOT" --env-file "$temp" -f "$COMPOSE" --profile test config --quiet
+    saved="$DATA/config/runtime-before-network-$(date -u +%Y%m%dT%H%M%S)-$(openssl rand -hex 3).env"
+    "${SUDO[@]}" install -m 600 "$ENV_FILE" "$saved"
+    "${SUDO[@]}" install -m 600 "$temp" "$ENV_FILE"
+    say "이전 설정 보관: $saved"
+    if [[ -n $running ]]; then
+        dc up -d --no-deps --wait --wait-timeout 120 $running
+    fi
+    say "주소·포트 변경 완료: $(cfg PUBLIC_ORIGIN) (VM HTTP $(http_port))"
+    say '정지 상태인 환경은 4번/13번으로 실행하세요. 외부 프록시의 도메인·인증서·연결 포트도 맞추고, 주소가 바뀌면 현장 QR을 다시 인쇄하세요.'
+)
 account_menu() {
     need_config
     local target=${1:-} username password password2 payload service
@@ -277,9 +311,11 @@ run_choice() {
         14) need_config;dc stop test;;
         15) need_config;confirm '테스트 DB·서명을 초기화하고 가상 명단을 생성합니다.' RESET && dc run --rm test python manage.py reset_sandbox --confirm RESET;;
         16) need_config;dc run --rm --no-deps test python scripts/load_test.py --origin "$(cfg PUBLIC_ORIGIN)";;
+        17) change_network;;
         *) say '메뉴 번호를 확인해주세요.';;
     esac
 }
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then return 0;fi
 if [[ ${1:-} == --check-syntax ]]; then exit 0;fi
 [[ $(uname -s) == Linux ]] || { say '이 스크립트는 Ubuntu VM에서 실행해주세요.';exit 1; }
 while true; do
@@ -294,6 +330,7 @@ while true; do
  11 관리자 계정       12 서비스 삭제
  13 테스트 환경 실행  14 테스트 환경 정지
  15 테스트 초기화     16 테스트 HTTP 부하 점검
+  17 접속 주소 / VM 포트 변경
   0 종료
 └───────────────────────────────────────────────────┘
 MENU

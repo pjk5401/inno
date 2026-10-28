@@ -6,6 +6,11 @@ on:
 jobs:
   containers:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        port: [80, 8080]
+    env:
+      SMOKE_PORT: ${{ matrix.port }}
     steps:
       - uses: actions/checkout@v4
       - name: Prepare isolated CI storage and credentials
@@ -13,7 +18,8 @@ jobs:
           sudo mkdir -p /var/lib/attendance/{postgres,signatures/live,signatures/test,backups}
           sudo chown -R 10001:10001 /var/lib/attendance/signatures
           {
-            echo 'PUBLIC_ORIGIN=http://localhost'
+            echo "PUBLIC_ORIGIN=http://localhost:$SMOKE_PORT"
+            echo "HTTP_PORT=$SMOKE_PORT"
             echo 'ALLOWED_HOSTS=localhost,127.0.0.1'
             for key in POSTGRES_PASSWORD LIVE_DB_PASSWORD TEST_DB_PASSWORD LIVE_SECRET_KEY TEST_SECRET_KEY; do
               printf '%s=%s\n' "$key" "$(openssl rand -hex 32)"
@@ -28,9 +34,10 @@ jobs:
           dc run --rm live python manage.py migrate --noinput
           dc run --rm test python manage.py migrate --noinput
           dc up -d --wait --wait-timeout 120 live test nginx
-          curl -fsS http://localhost/health/
-          curl -fsS http://localhost/test/health/
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost/test/staff/login/)" = 200
+          curl -fsS "http://localhost:$SMOKE_PORT/health/"
+          curl -fsS "http://localhost:$SMOKE_PORT/test/health/"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:$SMOKE_PORT/test/staff/login/")" = 200
+          curl -fsSI "http://localhost:$SMOKE_PORT/test" | grep -i '^location: /test/'
       - name: Verify database access isolation
         run: |
           docker compose --env-file "$RUNNER_TEMP/attendance.env" exec -T live python - <<'PY'
